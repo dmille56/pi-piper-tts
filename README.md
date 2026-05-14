@@ -1,6 +1,6 @@
 # pi-piper-tts
 
-A Pi package that adds a `/piper-tts` slash command.
+A Pi package that adds a `/piper-tts` slash command (and a `/tts` alias).
 
 ## What it does
 
@@ -49,7 +49,7 @@ pip install piper-tts
 
 ## Configuration
 
-You can configure `/tts` using environment variables (highest priority) and/or Pi `settings.json`.
+You can configure `/piper-tts` (and the `/tts` alias) using environment variables (highest priority) and/or Pi `settings.json`.
 
 ### Environment variables
 
@@ -122,14 +122,44 @@ export PIPER_PI_EXTRA_ARGS="--speaker 0"
 
 ## Usage
 
-Once Pi is running, type:
+Once Pi is running, type one of:
 
 ```text
 /piper-tts
 ```
 
-If you prefer, I can add `/piper-tts-command` as an alias too.
+or the convenience alias:
+
+```text
+/tts
+```
+
 Pi will speak the latest assistant message aloud.
+
+### `/tts` alias (optional)
+
+By default, this extension registers both commands:
+
+- `/piper-tts` (primary)
+- `/tts` (alias for `/piper-tts`)
+
+If you want to disable the `/tts` alias:
+
+**Environment variable (highest priority):**
+
+```bash
+export PIPER_PI_ENABLE_TTS_ALIAS=0
+```
+
+**Pi `settings.json`** (global: `~/.pi/agent/settings.json`, or project: `<cwd>/.pi/settings.json`):
+
+```json
+{
+  "pi-piper-tts": {
+    "enable-tts-alias": false
+  }
+}
+```
 
 ## Behavior
 

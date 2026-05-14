@@ -1,7 +1,7 @@
 {
   "name": "pi-piper-tts",
   "version": "0.1.0",
-  "description": "A Pi package that adds a /tts command for speaking the latest assistant message with Piper TTS.",
+  "description": "A Pi package that adds a /piper-tts command (and /tts alias) for speaking the latest assistant message with Piper TTS.",
   "type": "module",
   "license": "MIT",
   "keywords": [
