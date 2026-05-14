@@ -122,7 +122,7 @@ function getSettingsSection(s: Record<string, unknown>): Record<string, unknown>
 	// - { "pi-tts-command": { ... } }
 	// - { "tts": { ... } }
 	// - { "piper": { ... } }
-	const candidates = [s["pi-tts-command"], s["tts"], s["piper"]];
+	const candidates = [s["pi-piper-tts"], s["pi-tts-command"], s["tts"], s["piper"]];
 	for (const c of candidates) {
 		if (c && typeof c === "object" && !Array.isArray(c)) {
 			return c as Record<string, unknown>;
@@ -263,7 +263,7 @@ function formatSubprocessFailure(stderr: string, command: string): string {
 }
 
 export default function (pi: ExtensionAPI) {
-	pi.registerCommand("tts", {
+	pi.registerCommand("piper-tts", {
 		description: "Speak the latest assistant message",
 		handler: async (_args, ctx) => {
 			await ctx.waitForIdle();

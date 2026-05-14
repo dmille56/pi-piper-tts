@@ -1,10 +1,10 @@
-# pi-tts-command
+# pi-piper-tts
 
-A Pi package that adds a `/tts` slash command.
+A Pi package that adds a `/piper-tts` slash command.
 
 ## What it does
 
-`/tts` speaks the latest assistant message from the current session branch using local Piper TTS.
+`/piper-tts` speaks the latest assistant message from the current session branch using local Piper TTS.
 
 It:
 
@@ -19,19 +19,19 @@ It:
 Install from a local path while developing:
 
 ```bash
-pi install /absolute/path/to/pi-tts-command
+pi install /absolute/path/to/pi-piper-tts
 ```
 
 Once published to npm, install it like this:
 
 ```bash
-pi install npm:pi-tts-command
+pi install npm:pi-piper-tts
 ```
 
 Or pin a version:
 
 ```bash
-pi install npm:pi-tts-command@0.1.0
+pi install npm:pi-piper-tts@0.1.0
 ```
 
 ## Requirements
@@ -67,7 +67,8 @@ Alternatively (or in addition), you can set configuration in `settings.json`.
 
 Supported section/key names:
 
-- `pi-tts-command` (preferred)
+- `pi-piper-tts` (preferred)
+- `pi-tts-command` (legacy alias)
 - `tts`
 - `piper`
 
@@ -88,7 +89,7 @@ Example `settings.json`:
 
 ```json
 {
-  "pi-tts-command": {
+  "pi-piper-tts": {
     "piper-pi-model": "/path/to/your/voice.onnx",
     "piper-pi-data-dir": "$HOME/.local/share/piper",
     "piper-pi-bin": "python3 -m piper",
@@ -124,9 +125,10 @@ export PIPER_PI_EXTRA_ARGS="--speaker 0"
 Once Pi is running, type:
 
 ```text
-/tts
+/piper-tts
 ```
 
+If you prefer, I can add `/piper-tts-command` as an alias too.
 Pi will speak the latest assistant message aloud.
 
 ## Behavior
