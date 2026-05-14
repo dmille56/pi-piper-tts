@@ -1,7 +1,8 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { homedir } from "os";
+import { homedir, tmpdir } from "os";
 import { join } from "path";
-import { readFileSync } from "fs";
+import { randomUUID } from "crypto";
+import { existsSync, readFileSync } from "fs";
 
 type SessionEntry = {
 	type?: string;
@@ -255,7 +256,7 @@ function formatSubprocessFailure(stderr: string, command: string): string {
 	}
 
 	if (/model|voice|file|No such file|cannot find/i.test(output)) {
-		return `Piper could not load the configured voice/model. Check PIPER_MODEL and download the voice.`;
+		return `Piper could not load the configured voice/model. Check PIPER_MODEL and download the voice.\n\n--- Piper stderr/stdout ---\n${output}`;
 	}
 
 	return output;
@@ -295,6 +296,19 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			// Validate model path early so we can show a precise error.
+			if (!existsSync(config.model)) {
+				notify(ctx, `Piper model file not found at: ${config.model}`, "error");
+				return;
+			}
+
+			// Piper usually expects a sibling JSON config next to the ONNX.
+			const modelJsonPath = `${config.model}.json`;
+			if (!existsSync(modelJsonPath)) {
+				notify(ctx, `Piper voice config JSON not found at: ${modelJsonPath} (piper guesses this automatically).`, "error");
+				return;
+			}
+
 			notify(ctx, "Speaking latest assistant message...", "info");
 
 			const args = [
@@ -308,12 +322,69 @@ export default function (pi: ExtensionAPI) {
 			];
 
 			try {
+				// Helpful hint when debugging Piper configuration issues.
+				if (process.env.PIPER_TTS_DEBUG === "1") {
+					notify(ctx, `Piper config: command=${config.command} args=${JSON.stringify(args)}`, "info");
+				}
+
 				const result = await pi.exec(config.command, args, {
 					signal: ctx.signal,
 				});
 
 				if (result.code !== 0) {
-					const errorMessage = formatSubprocessFailure(result.stderr || result.stdout, config.command);
+					const output = (result.stderr || result.stdout || "").toString();
+
+					// Piper uses ffplay for playback; for long utterances it can exceed
+					// Piper's internal 5s wait timeout and throw a TimeoutExpired.
+					if (/ffplay/i.test(output) && /(timed out|TimeoutExpired)/i.test(output)) {
+						notify(ctx, "Piper playback timed out; retrying by rendering WAV then playing it.", "warning");
+
+						const wavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
+						const wavArgs = [
+							...config.args,
+							...(config.dataDir ? ["--data-dir", config.dataDir] : []),
+							"-m",
+							config.model,
+							...config.extraArgs,
+							"-f",
+							wavPath,
+							"--",
+							text,
+						];
+
+						const renderResult = await pi.exec(config.command, wavArgs, {
+							signal: ctx.signal,
+						});
+
+						if (renderResult.code !== 0) {
+							const renderOutput = (renderResult.stderr || renderResult.stdout || "").toString();
+							const errorMessage = formatSubprocessFailure(renderOutput, config.command);
+							notify(ctx, errorMessage, "error");
+							return;
+						}
+
+						// Play the generated WAV.
+						try {
+							const ffplayResult = await pi.exec(
+								"ffplay",
+								["-nodisp", "-autoexit", "-loglevel", "quiet", wavPath],
+								{ signal: ctx.signal }
+							);
+
+							if (ffplayResult.code !== 0) {
+								notify(ctx, `ffplay failed with exit code ${ffplayResult.code}.`, "error");
+								return;
+							}
+						} catch (e) {
+							notify(ctx, "ffplay failed. Is ffmpeg/ffplay installed and on PATH?", "error");
+							return;
+						}
+
+						notify(ctx, "Spoken latest assistant message.", "info");
+						return;
+					}
+
+					const errorMessage = formatSubprocessFailure(output, config.command);
 					notify(ctx, errorMessage, "error");
 					return;
 				}
