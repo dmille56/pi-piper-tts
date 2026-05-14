@@ -13,7 +13,6 @@
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "check": "npm run typecheck",
     "build": "echo 'nothing to build'",
     "release": "npm run typecheck && npm version patch && npm publish --access public",
     "prepublishOnly": "npm run check"
