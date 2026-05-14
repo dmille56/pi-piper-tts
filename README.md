@@ -49,15 +49,56 @@ pip install piper-tts
 
 ## Configuration
 
+You can configure `/tts` using environment variables (highest priority) and/or Pi `settings.json`.
+
+### Environment variables
+
 Set these environment variables before launching Pi:
 
 - `PIPER_MODEL` — required. Piper voice/model identifier or path passed to `-m`
-- `PIPER_BIN` — optional. Default is `python3`
+- `PIPER_BIN` — optional. Overrides the Piper command. Default is `python3 -m piper`
 - `PIPER_DATA_DIR` — optional. Passed to Piper as `--data-dir`
 - `PIPER_EXTRA_ARGS` — optional extra arguments appended to the Piper command
-- `PIPER_MAX_CHARS` — optional safety cap for long assistant messages
+- `PIPER_MAX_CHARS` — optional safety cap for long assistant messages (must be a positive integer)
 
-### Example
+### Pi settings (`settings.json`)
+
+Alternatively (or in addition), you can set configuration in `settings.json`.
+
+Supported section/key names:
+
+- `pi-tts-command` (preferred)
+- `tts`
+- `piper`
+
+Keys in that section:
+
+- `piper-model` — required (same value as `PIPER_MODEL`)
+- `piper-bin` — same as `PIPER_BIN`
+- `piper-data-dir` — same as `PIPER_DATA_DIR`
+- `piper-extra-args` — same as `PIPER_EXTRA_ARGS`
+- `piper-max-chars` — same as `PIPER_MAX_CHARS`
+
+Pi loads settings from:
+
+- `~/.pi/agent/settings.json` (global)
+- `<cwd>/.pi/settings.json` (project override, takes precedence)
+
+Example `settings.json`:
+
+```json
+{
+  "pi-tts-command": {
+    "piper-model": "/path/to/your/voice.onnx",
+    "piper-data-dir": "$HOME/.local/share/piper",
+    "piper-bin": "python3 -m piper",
+    "piper-extra-args": "--speaker 0",
+    "piper-max-chars": 8000
+  }
+}
+```
+
+### Quick environment-variable example
 
 ```bash
 export PIPER_MODEL=/path/to/your/voice.onnx
