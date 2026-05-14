@@ -1,4 +1,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { homedir } from "os";
+import { join } from "path";
+import { readFileSync } from "fs";
 
 type SessionEntry = {
 	type?: string;
@@ -85,33 +88,101 @@ function parseCommandLine(value: string): string[] {
 	return parts;
 }
 
-function getConfig(): PiperConfig | { error: string } {
-	const model = process.env.PIPER_MODEL?.trim();
+function expandPath(value: string): string {
+	const v = value.trim();
+	if (v === "~") return homedir();
+	if (v.startsWith("~/")) return join(homedir(), v.slice(2));
+	return value;
+}
+
+function loadPiSettingsFile(path: string): unknown {
+	try {
+		const raw = readFileSync(path, "utf-8");
+		return JSON.parse(raw) as unknown;
+	} catch {
+		return undefined;
+	}
+}
+
+function getPiSettings(ctx: ExtensionCommandContext): Record<string, unknown> {
+	const globalPath = join(homedir(), ".pi", "agent", "settings.json");
+	const cwd = (ctx as any).cwd ? String((ctx as any).cwd) : process.cwd();
+	const projectPath = join(cwd, ".pi", "settings.json");
+
+	const globalSettings = (loadPiSettingsFile(globalPath) ?? {}) as Record<string, unknown>;
+	const projectSettings = (loadPiSettingsFile(projectPath) ?? {}) as Record<string, unknown>;
+
+	// Project overrides global
+	return { ...globalSettings, ...projectSettings };
+}
+
+function getSettingsSection(s: Record<string, unknown>): Record<string, unknown> {
+	// Namespaced keys (pick one) in settings.json
+	// - { "pi-tts-command": { ... } }
+	// - { "tts": { ... } }
+	// - { "piper": { ... } }
+	const candidates = [s["pi-tts-command"], s["tts"], s["piper"]];
+	for (const c of candidates) {
+		if (c && typeof c === "object" && !Array.isArray(c)) {
+			return c as Record<string, unknown>;
+		}
+	}
+	return {};
+}
+
+function getConfig(ctx: ExtensionCommandContext): PiperConfig | { error: string } {
+	const settings = getPiSettings(ctx);
+	const section = getSettingsSection(settings);
+
+	const modelRaw = process.env.PIPER_MODEL?.trim() || (section["piper-model"] ? String(section["piper-model"]) : "").trim();
+	const model = modelRaw ? expandPath(modelRaw) : "";
 	if (!model) {
-		return { error: "Missing PIPER_MODEL. Set it to a Piper voice/model path or identifier." };
+		return { error: "Missing Piper model. Set PIPER_MODEL (env) or settings.json 'pi-tts-command.piper-model'." };
 	}
 
-	const binSpec = process.env.PIPER_BIN?.trim();
-	const binParts = parseCommandLine(binSpec || DEFAULT_PIPER_COMMAND);
+	const binFromEnv = process.env.PIPER_BIN?.trim();
+	const binFromSettings = section["piper-bin"] ? String(section["piper-bin"]).trim() : "";
+	const binSpec = binFromEnv || binFromSettings || DEFAULT_PIPER_COMMAND;
+
+	const binParts = parseCommandLine(binSpec || "");
 	if (binParts.length === 0) {
-		return { error: "PIPER_BIN is empty." };
+		return { error: "PIPER_BIN / settings.json piper-bin is empty." };
 	}
 
-	const extraArgs = process.env.PIPER_EXTRA_ARGS?.trim()
-		? parseCommandLine(process.env.PIPER_EXTRA_ARGS)
-		: [];
+	const command = binParts[0];
+	const runnerArgs = binParts.length > 1 ? binParts.slice(1) : [];
 
-	const maxCharsRaw = process.env.PIPER_MAX_CHARS?.trim();
-	const maxChars = maxCharsRaw ? Number.parseInt(maxCharsRaw, 10) : undefined;
-	if (maxCharsRaw && (!Number.isFinite(maxChars) || (maxChars ?? 0) <= 0)) {
+	let extraArgs: string[] = [];
+	const envExtraArgs = process.env.PIPER_EXTRA_ARGS?.trim();
+	if (envExtraArgs) {
+		extraArgs = parseCommandLine(envExtraArgs);
+	} else {
+		const fromSettings = section["piper-extra-args"];
+		const settingsExtraArgs = fromSettings ? String(fromSettings).trim() : "";
+		extraArgs = settingsExtraArgs ? parseCommandLine(settingsExtraArgs) : [];
+	}
+
+	const dataDirRaw = process.env.PIPER_DATA_DIR?.trim() || (section["piper-data-dir"] ? String(section["piper-data-dir"]) : "").trim();
+	const dataDir = dataDirRaw ? expandPath(dataDirRaw) : undefined;
+
+	const maxCharsRaw = process.env.PIPER_MAX_CHARS?.trim() || (section["piper-max-chars"] !== undefined ? String(section["piper-max-chars"]) : "").trim();
+	const maxCharsParsed = maxCharsRaw ? Number.parseInt(maxCharsRaw, 10) : undefined;
+	const maxChars = maxCharsParsed !== undefined && Number.isFinite(maxCharsParsed) && maxCharsParsed > 0 ? maxCharsParsed : undefined;
+
+	if (maxCharsRaw && maxChars === undefined) {
 		return { error: "PIPER_MAX_CHARS must be a positive integer." };
 	}
 
+	// Back-compat: if runner was only the python command, use the old default args.
+	if (command === DEFAULT_PIPER_COMMAND && runnerArgs.length === 0) {
+		runnerArgs.push(...DEFAULT_PIPER_COMMAND_ARGS);
+	}
+
 	return {
-		command: binParts[0],
-		args: binSpec && binParts.length > 1 ? binParts.slice(1) : DEFAULT_PIPER_COMMAND_ARGS,
+		command,
+		args: runnerArgs,
 		model,
-		dataDir: process.env.PIPER_DATA_DIR?.trim() || undefined,
+		dataDir,
 		extraArgs,
 		maxChars,
 	};
@@ -196,7 +267,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			await ctx.waitForIdle();
 
-			const config = getConfig();
+			const config = getConfig(ctx);
 			if ("error" in config) {
 				notify(ctx, config.error, "error");
 				return;
