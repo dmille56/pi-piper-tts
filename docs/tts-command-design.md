@@ -144,11 +144,11 @@ Use environment variables for the first version. This avoids designing a new set
 
 Suggested config surface:
 
-- `PIPER_MODEL` — required Piper voice/model identifier or path passed to `-m`
-- `PIPER_DATA_DIR` — optional Piper `--data-dir`
-- `PIPER_BIN` — optional command override, default `python3 -m piper`
-- `PIPER_EXTRA_ARGS` — optional extra CLI args for advanced users
-- `PIPER_MAX_CHARS` — optional safety cap to keep very long answers from producing huge audio
+- `PIPER_PI_MODEL` — required Piper voice/model identifier or path passed to `-m`
+- `PIPER_PI_DATA_DIR` — optional Piper `--data-dir`
+- `PIPER_PI_BIN` — optional command override, default `python3 -m piper`
+- `PIPER_PI_EXTRA_ARGS` — optional extra CLI args for advanced users
+- `PIPER_PI_MAX_CHARS` — optional safety cap to keep very long answers from producing huge audio
 
 The extension should validate configuration on startup or on first use and show a clear error if the model is missing.
 

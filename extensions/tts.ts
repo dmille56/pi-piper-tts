@@ -135,43 +135,43 @@ function getConfig(ctx: ExtensionCommandContext): PiperConfig | { error: string 
 	const settings = getPiSettings(ctx);
 	const section = getSettingsSection(settings);
 
-	const modelRaw = process.env.PIPER_MODEL?.trim() || (section["piper-model"] ? String(section["piper-model"]) : "").trim();
+	const modelRaw = process.env.PIPER_PI_MODEL?.trim() || (section["piper-pi-model"] ? String(section["piper-pi-model"]) : "").trim();
 	const model = modelRaw ? expandPath(modelRaw) : "";
 	if (!model) {
-		return { error: "Missing Piper model. Set PIPER_MODEL (env) or settings.json 'pi-tts-command.piper-model'." };
+		return { error: "Missing Piper model. Set PIPER_PI_MODEL (env) or settings.json 'pi-tts-command.piper-pi-model'." };
 	}
 
-	const binFromEnv = process.env.PIPER_BIN?.trim();
-	const binFromSettings = section["piper-bin"] ? String(section["piper-bin"]).trim() : "";
+	const binFromEnv = process.env.PIPER_PI_BIN?.trim();
+	const binFromSettings = section["piper-pi-bin"] ? String(section["piper-pi-bin"]).trim() : "";
 	const binSpec = binFromEnv || binFromSettings || DEFAULT_PIPER_COMMAND;
 
 	const binParts = parseCommandLine(binSpec || "");
 	if (binParts.length === 0) {
-		return { error: "PIPER_BIN / settings.json piper-bin is empty." };
+		return { error: "PIPER_PI_BIN / settings.json piper-pi-bin is empty." };
 	}
 
 	const command = binParts[0];
 	const runnerArgs = binParts.length > 1 ? binParts.slice(1) : [];
 
 	let extraArgs: string[] = [];
-	const envExtraArgs = process.env.PIPER_EXTRA_ARGS?.trim();
+	const envExtraArgs = process.env.PIPER_PI_EXTRA_ARGS?.trim();
 	if (envExtraArgs) {
 		extraArgs = parseCommandLine(envExtraArgs);
 	} else {
-		const fromSettings = section["piper-extra-args"];
+		const fromSettings = section["piper-pi-extra-args"];
 		const settingsExtraArgs = fromSettings ? String(fromSettings).trim() : "";
 		extraArgs = settingsExtraArgs ? parseCommandLine(settingsExtraArgs) : [];
 	}
 
-	const dataDirRaw = process.env.PIPER_DATA_DIR?.trim() || (section["piper-data-dir"] ? String(section["piper-data-dir"]) : "").trim();
+	const dataDirRaw = process.env.PIPER_PI_DATA_DIR?.trim() || (section["piper-pi-data-dir"] ? String(section["piper-pi-data-dir"]) : "").trim();
 	const dataDir = dataDirRaw ? expandPath(dataDirRaw) : undefined;
 
-	const maxCharsRaw = process.env.PIPER_MAX_CHARS?.trim() || (section["piper-max-chars"] !== undefined ? String(section["piper-max-chars"]) : "").trim();
+	const maxCharsRaw = process.env.PIPER_PI_MAX_CHARS?.trim() || (section["piper-pi-max-chars"] !== undefined ? String(section["piper-pi-max-chars"]) : "").trim();
 	const maxCharsParsed = maxCharsRaw ? Number.parseInt(maxCharsRaw, 10) : undefined;
 	const maxChars = maxCharsParsed !== undefined && Number.isFinite(maxCharsParsed) && maxCharsParsed > 0 ? maxCharsParsed : undefined;
 
 	if (maxCharsRaw && maxChars === undefined) {
-		return { error: "PIPER_MAX_CHARS must be a positive integer." };
+		return { error: "PIPER_PI_MAX_CHARS must be a positive integer." };
 	}
 
 	// Back-compat: if runner was only the python command, use the old default args.
@@ -256,7 +256,7 @@ function formatSubprocessFailure(stderr: string, command: string): string {
 	}
 
 	if (/model|voice|file|No such file|cannot find/i.test(output)) {
-		return `Piper could not load the configured voice/model. Check PIPER_MODEL and download the voice.\n\n--- Piper stderr/stdout ---\n${output}`;
+		return `Piper could not load the configured voice/model. Check PIPER_PI_MODEL and download the voice.\n\n--- Piper stderr/stdout ---\n${output}`;
 	}
 
 	return output;
@@ -323,7 +323,7 @@ export default function (pi: ExtensionAPI) {
 
 			try {
 				// Helpful hint when debugging Piper configuration issues.
-				if (process.env.PIPER_TTS_DEBUG === "1") {
+				if (process.env.PIPER_PI_TTS_DEBUG === "1") {
 					notify(ctx, `Piper config: command=${config.command} args=${JSON.stringify(args)}`, "info");
 				}
 
