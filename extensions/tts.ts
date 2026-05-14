@@ -151,7 +151,14 @@ function parseOptionalBoolean(value: unknown): boolean | undefined {
 	}
 }
 
-function isTtsAliasEnabled(ctx: ExtensionCommandContext): boolean {
+function isTtsAliasEnabledFromSettings(section: Record<string, unknown>): boolean {
+	// Keep it simple: section key `enable-tts-alias`.
+	const raw = section["enable-tts-alias"] ?? section["enableTtsAlias"];
+	const parsed = parseOptionalBoolean(raw);
+	return parsed !== undefined ? parsed : true;
+}
+
+function isTtsAliasEnabledAtLoad(): boolean {
 	// Default ON for backward compatibility.
 	const envRaw = process.env.PIPER_PI_ENABLE_TTS_ALIAS?.trim();
 	if (envRaw) {
@@ -160,14 +167,15 @@ function isTtsAliasEnabled(ctx: ExtensionCommandContext): boolean {
 		return true;
 	}
 
-	const settings = getPiSettings(ctx);
+	const globalPath = join(homedir(), ".pi", "agent", "settings.json");
+	const projectPath = join(process.cwd(), ".pi", "settings.json");
+	const globalSettings = (loadPiSettingsFile(globalPath) ?? {}) as Record<string, unknown>;
+	const projectSettings = (loadPiSettingsFile(projectPath) ?? {}) as Record<string, unknown>;
+	const settings = { ...globalSettings, ...projectSettings };
 	const section = getSettingsSection(settings);
-
-	// Keep it simple: section key `enable-tts-alias`.
-	const raw = section["enable-tts-alias"] ?? section["enableTtsAlias"];
-	const parsed = parseOptionalBoolean(raw);
-	return parsed !== undefined ? parsed : true;
+	return isTtsAliasEnabledFromSettings(section);
 }
+
 
 function getConfig(ctx: ExtensionCommandContext): PiperConfig | { error: string } {
 	const settings = getPiSettings(ctx);
@@ -439,19 +447,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Convenience alias: Pi users often expect `/tts`.
-	pi.registerCommand("tts", {
-		description: "Alias for /piper-tts",
-		handler: async (_args, ctx) => {
-			if (!isTtsAliasEnabled(ctx)) {
-				notify(
-					ctx,
-					"The /tts alias is disabled. Enable it with `enable-tts-alias: true` (settings.json) or `PIPER_PI_ENABLE_TTS_ALIAS=1` (env).",
-					"warning"
-				);
-				return;
-			}
-			return speakLatestAssistant(_args, ctx);
-		},
-	});
+	// If disabled, we do NOT register the command at all.
+	if (isTtsAliasEnabledAtLoad()) {
+		pi.registerCommand("tts", {
+			description: "Alias for /piper-tts",
+			handler: speakLatestAssistant,
+		});
+	}
 }
 

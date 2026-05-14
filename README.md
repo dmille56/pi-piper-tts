@@ -143,7 +143,7 @@ By default, this extension registers both commands:
 - `/piper-tts` (primary)
 - `/tts` (alias for `/piper-tts`)
 
-If you want to disable the `/tts` alias:
+If you want to disable the `/tts` alias (it will be *unregistered*):
 
 **Environment variable (highest priority):**
 
@@ -159,6 +159,8 @@ export PIPER_PI_ENABLE_TTS_ALIAS=0
     "enable-tts-alias": false
   }
 }
+
+This is read when the extension loads; you may need to restart (or `/reload`) after changing it.
 ```
 
 ## Behavior
