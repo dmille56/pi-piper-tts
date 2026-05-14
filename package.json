@@ -13,8 +13,12 @@
   ],
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "xo; echo EXIT:$?",
+    "lint-fix": "xo --fix",
+    "format": "prettier --write .",
+    "check": "npm run typecheck && npm run lint",
     "build": "echo 'nothing to build'",
-    "release": "npm run typecheck && npm version patch && npm publish --access public",
+    "release": "npm run check && npm version patch && npm publish --access public",
     "prepublishOnly": "npm run check"
   },
   "files": [
@@ -29,7 +33,31 @@
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.0",
     "@types/node": "^22.0.0",
-    "typescript": "^5.8.0"
+    "prettier": "3.7.4",
+    "typescript": "^5.8.0",
+    "xo": "^2.0.2"
+  },
+  "xo": {
+    "space": true,
+    "prettier": true,
+    "rules": {
+      "import-x/extensions": "off",
+      "function-paren-newline": "off",
+      "@stylistic/object-curly-newline": "off",
+      "@stylistic/operator-linebreak": "off",
+      "@stylistic/multiline-ternary": "off",
+      "@stylistic/arrow-parens": "off",
+      "@stylistic/function-paren-newline": "off",
+      "@stylistic/curly-newline": "off",
+      "capitalized-comments": "off",
+      "complexity": "off",
+      "max-lines-per-function": "off",
+      "max-lines": "off",
+      "max-params": "off",
+      "require-unicode-regexp": "off",
+      "unicorn/no-abusive-eslint-disable": "off",
+      "n/prefer-global/process": "off"
+    }
   },
   "pi": {
     "extensions": [
