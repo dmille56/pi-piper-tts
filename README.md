@@ -1,6 +1,6 @@
-# `/tts` Pi Extension
+# pi-tts-command
 
-This project includes a TypeScript Pi extension that registers the `/tts` command.
+A Pi package that adds a `/tts` slash command.
 
 ## What it does
 
@@ -14,13 +14,29 @@ It:
 - normalizes whitespace
 - calls Piper locally through `pi.exec()`
 
-## Files
+## Install
 
-- `.pi/extensions/tts.ts` — extension implementation
+Install from a local path while developing:
+
+```bash
+pi install /absolute/path/to/pi-tts-command
+```
+
+Once published to npm, install it like this:
+
+```bash
+pi install npm:pi-tts-command
+```
+
+Or pin a version:
+
+```bash
+pi install npm:pi-tts-command@0.1.0
+```
 
 ## Requirements
 
-- Pi with extension support
+- Pi with package support
 - Python 3
 - Piper installed locally:
 
@@ -81,6 +97,14 @@ Common cases:
 - `PIPER_MODEL` is missing
 - Piper is not installed
 - the configured voice/model cannot be loaded
+
+## Publishing
+
+This package is ready to publish to npm.
+
+```bash
+npm publish
+```
 
 ## Notes
 

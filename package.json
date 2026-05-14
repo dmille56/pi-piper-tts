@@ -1,0 +1,27 @@
+{
+  "name": "pi-tts-command",
+  "version": "0.1.0",
+  "description": "A Pi package that adds a /tts command for speaking the latest assistant message with Piper TTS.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi-extension", "tts", "piper", "speech-synthesis"],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "npm run typecheck",
+    "build": "echo 'nothing to build'",
+    "release": "npm run typecheck && npm version patch && npm publish --access public",
+    "prepublishOnly": "npm run check"
+  },
+  "files": ["extensions", "README.md", "LICENSE"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  },
+  "pi": {
+    "extensions": ["extensions"]
+  }
+}
