@@ -38,12 +38,13 @@ pi install npm:pi-tts-command@0.1.0
 
 - Pi with package support
 - Python 3
-- Piper installed locally:
+- **Piper (piper-tts) installed locally**:
 
 ```bash
 pip install piper-tts
 ```
 
+- **ffplay installed** (from `ffmpeg`) and available on your `PATH`
 - A Piper voice/model downloaded and available locally
 
 ## Configuration
@@ -95,7 +96,7 @@ Common cases:
 - no assistant message yet
 - latest assistant message has no text
 - `PIPER_MODEL` is missing
-- Piper is not installed
+- Piper is not installed (or `ffplay` is missing)
 - the configured voice/model cannot be loaded
 
 ## Publishing
