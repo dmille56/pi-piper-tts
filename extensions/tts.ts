@@ -5,6 +5,7 @@ import {existsSync, readFileSync} from 'node:fs';
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
+  ExtensionContext,
 } from '@earendil-works/pi-coding-agent';
 
 type SessionEntry = {
@@ -31,6 +32,9 @@ type PiperConfig = {
 
 const defaultPiperCommand = 'python3';
 const defaultPiperCommandArgs = ['-m', 'piper'];
+
+// Module-scope so `/piper-tts-stop` can cancel the currently running playback.
+let activePlaybackController: AbortController | undefined;
 
 function notify(
   ctx: ExtensionCommandContext,
@@ -391,82 +395,153 @@ function formatSubprocessFailure(stderr: string, command: string): string {
   return output;
 }
 
+function stopCurrentPlayback() {
+  activePlaybackController?.abort();
+}
+
 export default function piperTtsExtension(pi: ExtensionAPI) {
+  pi.on('session_shutdown', () => {
+    stopCurrentPlayback();
+  });
+
+  pi.on('session_before_switch', () => {
+    stopCurrentPlayback();
+  });
+
+  pi.on('session_before_fork', () => {
+    stopCurrentPlayback();
+  });
+
+  pi.on('session_before_tree', () => {
+    stopCurrentPlayback();
+  });
+
+  // Stop playback when the agent begins a new turn, or when the assistant
+  // message is streaming/updating (prevents overlapping audio).
+  pi.on('turn_start', () => {
+    stopCurrentPlayback();
+  });
+
+  pi.on('message_start', (event) => {
+    if (event.message?.role === 'assistant') stopCurrentPlayback();
+  });
+
+  pi.on('message_update', (event) => {
+    if (event.message?.role === 'assistant') stopCurrentPlayback();
+  });
+  const isAbortError = (error: unknown): boolean => {
+    if (!(error instanceof Error)) return false;
+    return (
+      error.name === 'AbortError' ||
+      /\baborted\b/i.test(error.message) ||
+      /\babort\b/i.test(error.message)
+    );
+  };
+
   const speakLatestAssistant: ExtensionAPI['registerCommand'] extends (
     ...args: any[]
   ) => any
     ? (_args: unknown, ctx: ExtensionCommandContext) => Promise<void>
     : never = async (_args: unknown, ctx: ExtensionCommandContext) => {
-    await ctx.waitForIdle();
+    // Cancel any previous playback before starting a new one.
+    activePlaybackController?.abort();
 
-    const config = getConfig(ctx);
-    if ('error' in config) {
-      notify(ctx, config.error, 'error');
-      return;
-    }
+    const playbackController = new AbortController();
+    activePlaybackController = playbackController;
 
-    const branch = ctx.sessionManager.getBranch() as SessionEntry[];
-    const latestAssistant = findLatestAssistantMessage(branch);
+    const cleanup = () => {
+      if (activePlaybackController === playbackController) {
+        activePlaybackController = undefined;
+      }
+    };
 
-    if (!latestAssistant) {
-      notify(ctx, 'No assistant message to speak yet.', 'warning');
-      return;
-    }
+    const onCtxAbort = () => {
+      playbackController.abort();
+    };
 
-    let text = normalizeSpeechText(
-      extractSpokenText(latestAssistant.message?.content),
-    );
-    if (!text) {
-      notify(
-        ctx,
-        'Latest assistant message contains no spoken text.',
-        'warning',
-      );
-      return;
-    }
-
-    if (config.maxChars && text.length > config.maxChars) {
-      const truncated = truncateText(text, config.maxChars);
-      text = truncated.text;
-      if (truncated.truncated) {
-        notify(
-          ctx,
-          `Latest assistant message was truncated to ${config.maxChars} characters for speech.`,
-          'warning',
-        );
+    if (ctx.signal) {
+      if (ctx.signal.aborted) {
+        playbackController.abort();
+      } else {
+        ctx.signal.addEventListener('abort', onCtxAbort, {once: true});
       }
     }
 
-    // Validate model path early so we can show a precise error.
-    if (!existsSync(config.model)) {
-      notify(ctx, `Piper model file not found at: ${config.model}`, 'error');
-      return;
-    }
-
-    // Piper usually expects a sibling JSON config next to the ONNX.
-    const modelJsonPath = `${config.model}.json`;
-    if (!existsSync(modelJsonPath)) {
-      notify(
-        ctx,
-        `Piper voice config JSON not found at: ${modelJsonPath} (piper guesses this automatically).`,
-        'error',
-      );
-      return;
-    }
-
-    notify(ctx, 'Speaking latest assistant message...', 'info');
-
-    const args = [
-      ...config.args,
-      ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
-      '-m',
-      config.model,
-      ...config.extraArgs,
-      '--',
-      text,
-    ];
+    let commandForError = 'piper';
 
     try {
+      await ctx.waitForIdle();
+      if (playbackController.signal.aborted) return;
+
+      const config = getConfig(ctx);
+      if ('error' in config) {
+        notify(ctx, config.error, 'error');
+        return;
+      }
+
+      commandForError = config.command;
+
+      const branch = ctx.sessionManager.getBranch() as SessionEntry[];
+      const latestAssistant = findLatestAssistantMessage(branch);
+
+      if (!latestAssistant) {
+        notify(ctx, 'No assistant message to speak yet.', 'warning');
+        return;
+      }
+
+      let text = normalizeSpeechText(
+        extractSpokenText(latestAssistant.message?.content),
+      );
+      if (!text) {
+        notify(
+          ctx,
+          'Latest assistant message contains no spoken text.',
+          'warning',
+        );
+        return;
+      }
+
+      if (config.maxChars && text.length > config.maxChars) {
+        const truncated = truncateText(text, config.maxChars);
+        text = truncated.text;
+        if (truncated.truncated) {
+          notify(
+            ctx,
+            `Latest assistant message was truncated to ${config.maxChars} characters for speech.`,
+            'warning',
+          );
+        }
+      }
+
+      // Validate model path early so we can show a precise error.
+      if (!existsSync(config.model)) {
+        notify(ctx, `Piper model file not found at: ${config.model}`, 'error');
+        return;
+      }
+
+      // Piper usually expects a sibling JSON config next to the ONNX.
+      const modelJsonPath = `${config.model}.json`;
+      if (!existsSync(modelJsonPath)) {
+        notify(
+          ctx,
+          `Piper voice config JSON not found at: ${modelJsonPath} (piper guesses this automatically).`,
+          'error',
+        );
+        return;
+      }
+
+      notify(ctx, 'Speaking latest assistant message...', 'info');
+
+      const args = [
+        ...config.args,
+        ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
+        '-m',
+        config.model,
+        ...config.extraArgs,
+        '--',
+        text,
+      ];
+
       // Helpful hint when debugging Piper configuration issues.
       if (process.env.PIPER_PI_TTS_DEBUG === '1') {
         notify(
@@ -477,8 +552,9 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
       }
 
       const result = await pi.exec(config.command, args, {
-        signal: ctx.signal,
+        signal: playbackController.signal,
       });
+      if (playbackController.signal.aborted) return;
 
       if (result.code !== 0) {
         const output = (result.stderr || result.stdout || '').toString();
@@ -509,8 +585,9 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
           ];
 
           const renderResult = await pi.exec(config.command, wavArgs, {
-            signal: ctx.signal,
+            signal: playbackController.signal,
           });
+          if (playbackController.signal.aborted) return;
 
           if (renderResult.code !== 0) {
             const renderOutput = (
@@ -531,8 +608,9 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
             const ffplayResult = await pi.exec(
               'ffplay',
               ['-nodisp', '-autoexit', '-loglevel', 'quiet', wavPath],
-              {signal: ctx.signal},
+              {signal: playbackController.signal},
             );
+            if (playbackController.signal.aborted) return;
 
             if (ffplayResult.code !== 0) {
               notify(
@@ -543,6 +621,7 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
               return;
             }
           } catch {
+            if (playbackController.signal.aborted) return;
             notify(
               ctx,
               'ffplay failed. Is ffmpeg/ffplay installed and on PATH?',
@@ -562,13 +641,35 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
 
       notify(ctx, 'Spoken latest assistant message.', 'info');
     } catch (error) {
-      notify(ctx, formatExecError(config.command, error), 'error');
+      if (playbackController.signal.aborted || isAbortError(error)) return;
+      notify(ctx, formatExecError(commandForError, error), 'error');
+    } finally {
+      cleanup();
     }
+  };
+
+  const stopPlayback: ExtensionAPI['registerCommand'] extends (
+    ...args: any[]
+  ) => any
+    ? (_args: unknown, ctx: ExtensionCommandContext) => Promise<void>
+    : never = async (_args: unknown, ctx: ExtensionCommandContext) => {
+    if (!activePlaybackController) {
+      notify(ctx, 'No active piper playback to stop.', 'warning');
+      return;
+    }
+
+    activePlaybackController.abort();
+    notify(ctx, 'Stopped piper playback.', 'info');
   };
 
   pi.registerCommand('piper-tts', {
     description: 'Speak the latest assistant message',
     handler: speakLatestAssistant,
+  });
+
+  pi.registerCommand('piper-tts-stop', {
+    description: 'Stop the current piper playback',
+    handler: stopPlayback,
   });
 
   // Convenience alias: Pi users often expect `/tts`.
@@ -577,6 +678,11 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
     pi.registerCommand('tts', {
       description: 'Alias for /piper-tts',
       handler: speakLatestAssistant,
+    });
+
+    pi.registerCommand('tts-stop', {
+      description: 'Alias for /piper-tts-stop',
+      handler: stopPlayback,
     });
   }
 }
