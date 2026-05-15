@@ -63,11 +63,14 @@ Set these environment variables before launching Pi:
 - `PIPER_PI_DATA_DIR` — optional. Passed to Piper as `--data-dir`
 - `PIPER_PI_EXTRA_ARGS` — optional extra arguments appended to the Piper command
 - `PIPER_PI_MAX_CHARS` — optional safety cap for long assistant messages (must be a positive integer)
+- `PIPER_PI_CHUNK_CHARS` — optional. Split long assistant messages into smaller chunks so speech starts earlier and `/piper-tts-stop` can cancel reliably mid-message. Must be a positive integer. Default: 200. Set to `0` (or negative) to disable chunking.
 - `PIPER_PI_AUTO_PLAY` — optional. When truthy, auto-plays TTS after the agent finishes a user-triggered run.
 
 ### Pi settings (`settings.json`)
 
 Alternatively (or in addition), you can set configuration in `settings.json`.
+
+Note: chunking happens after any global truncation from `PIPER_PI_MAX_CHARS` / `piper-pi-max-chars` is applied.
 
 Supported section/key names:
 
@@ -83,6 +86,7 @@ Keys in that section:
 - `piper-pi-data-dir` — same as `PIPER_PI_DATA_DIR`
 - `piper-pi-extra-args` — same as `PIPER_PI_EXTRA_ARGS`
 - `piper-pi-max-chars` — same as `PIPER_PI_MAX_CHARS`
+- `piper-pi-chunk-chars` — same as `PIPER_PI_CHUNK_CHARS`
 - `auto-play` — optional boolean. When true, auto-plays TTS after the agent finishes a user-triggered run.
 
 Pi loads settings from:

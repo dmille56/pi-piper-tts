@@ -29,6 +29,7 @@ type PiperConfig = {
   dataDir?: string;
   extraArgs: string[];
   maxChars?: number;
+  chunkChars?: number;
 };
 
 const defaultPiperCommand = 'python3';
@@ -316,6 +317,33 @@ function getConfig(ctx: ExtensionContext): PiperConfig | {error: string} {
     return {error: 'PIPER_PI_MAX_CHARS must be a positive integer.'};
   }
 
+  const defaultChunkChars = 200;
+
+  const chunkCharsFromEnv = process.env.PIPER_PI_CHUNK_CHARS?.trim();
+  const chunkCharsFromSettingsRaw = section['piper-pi-chunk-chars'];
+  const chunkCharsRaw =
+    chunkCharsFromEnv ??
+    (typeof chunkCharsFromSettingsRaw === 'string'
+      ? chunkCharsFromSettingsRaw.trim()
+      : '');
+
+  const chunkCharsParsed = chunkCharsRaw
+    ? Number.parseInt(chunkCharsRaw, 10)
+    : undefined;
+
+  const chunkChars =
+    chunkCharsRaw &&
+    chunkCharsParsed !== undefined &&
+    Number.isFinite(chunkCharsParsed)
+      ? chunkCharsParsed > 0
+        ? chunkCharsParsed
+        : undefined // non-positive disables
+      : // If user explicitly provided a value but it was invalid/non-numeric,
+        // treat it as disabled instead of failing.
+        chunkCharsRaw
+        ? undefined
+        : defaultChunkChars;
+
   // Back-compat: if runner was only the python command, use the old default args.
   if (command === defaultPiperCommand && runnerArgs.length === 0) {
     runnerArgs.push(...defaultPiperCommandArgs);
@@ -328,6 +356,7 @@ function getConfig(ctx: ExtensionContext): PiperConfig | {error: string} {
     dataDir,
     extraArgs,
     maxChars,
+    chunkChars,
   };
 }
 
@@ -338,6 +367,114 @@ function isAbortError(error: unknown): boolean {
     /\baborted\b/i.test(error.message) ||
     /\babort\b/i.test(error.message)
   );
+}
+
+function splitSpeechIntoChunks(text: string, chunkChars: number): string[] {
+  if (!text) return [];
+  if (!Number.isFinite(chunkChars) || chunkChars <= 0) return [text];
+
+  // 1) Break into sentence-ish units.
+  const units: string[] = [];
+  let current = '';
+
+  const isSentenceEnd = (ch: string) => ch === '.' || ch === '!' || ch === '?';
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+
+    if (ch === '\n' || ch === '\r') {
+      const trimmed = current.trim();
+      if (trimmed) units.push(trimmed);
+      current = '';
+      continue;
+    }
+
+    current += ch;
+
+    if (isSentenceEnd(ch)) {
+      // Include consecutive punctuation (e.g. "..." or "!!!").
+      let j = i + 1;
+      while (j < text.length && isSentenceEnd(text[j])) {
+        current += text[j];
+        j++;
+      }
+
+      i = j - 1;
+
+      const trimmed = current.trim();
+      if (trimmed) units.push(trimmed);
+      current = '';
+    }
+  }
+
+  const tail = current.trim();
+  if (tail) units.push(tail);
+
+  if (units.length === 0) return [text];
+
+  // 2) Pack units into <= chunkChars chunks.
+  const chunks: string[] = [];
+  let chunk = '';
+
+  const flushChunk = () => {
+    const trimmed = chunk.trim();
+    if (trimmed) chunks.push(trimmed);
+    chunk = '';
+  };
+
+  const hardSplit = (s: string): string[] => {
+    if (s.length <= chunkChars) return [s];
+    const segs: string[] = [];
+    for (let i = 0; i < s.length; i += chunkChars) {
+      segs.push(s.slice(i, i + chunkChars));
+    }
+
+    return segs;
+  };
+
+  for (const unit of units) {
+    if (!unit) continue;
+
+    if (unit.length <= chunkChars) {
+      if (!chunk) {
+        chunk = unit;
+        continue;
+      }
+
+      if (chunk.length + 1 + unit.length <= chunkChars) {
+        chunk = `${chunk} ${unit}`;
+        continue;
+      }
+
+      flushChunk();
+      chunk = unit;
+      continue;
+    }
+
+    // Unit is too large: split by spaces first, then hard-split long words.
+    const words = unit.split(/\s+/g).filter(Boolean);
+    for (const word of words) {
+      const segments = hardSplit(word);
+      for (const [si, seg] of segments.entries()) {
+        const joiner = chunk.length === 0 ? '' : si === 0 ? ' ' : '';
+
+        if (!chunk) {
+          chunk = seg;
+          continue;
+        }
+
+        if (chunk.length + joiner.length + seg.length <= chunkChars) {
+          chunk = `${chunk}${joiner}${seg}`;
+        } else {
+          flushChunk();
+          chunk = seg;
+        }
+      }
+    }
+  }
+
+  flushChunk();
+  return chunks.length > 0 ? chunks : [text];
 }
 
 async function speakText(
@@ -420,78 +557,119 @@ async function speakText(
       return;
     }
 
-    notify(ctx, 'Speaking latest assistant message...', 'info');
+    const {chunkChars} = config;
+    const chunks =
+      chunkChars && chunkChars > 0 && speechText.length > chunkChars
+        ? splitSpeechIntoChunks(speechText, chunkChars)
+        : [speechText];
 
-    // Always render to a temporary WAV first.
-    wavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
-
-    const wavArgs = [
-      ...config.args,
-      ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
-      '-m',
-      config.model,
-      ...config.extraArgs,
-      '-f',
-      wavPath,
-      '--',
-      speechText,
-    ];
-
-    // Helpful hint when debugging Piper configuration issues.
-    if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+    if (chunks.length === 1) {
+      notify(ctx, 'Speaking latest assistant message...', 'info');
+    } else {
       notify(
         ctx,
-        `Piper config: command=${config.command} args=${JSON.stringify(wavArgs)}`,
+        `Speaking latest assistant message in ${chunks.length} chunks...`,
         'info',
       );
     }
 
-    commandForError = config.command;
-    const renderResult = await pi.exec(config.command, wavArgs, {
-      signal: playbackController.signal,
-    });
+    for (let i = 0; i < chunks.length; i++) {
+      if (playbackController.signal.aborted) return;
 
-    if (playbackController.signal.aborted || renderResult.killed) {
-      return;
-    }
+      const chunkText = chunks[i];
+      if (!chunkText) continue;
 
-    if (renderResult.code !== 0) {
-      const renderOutput = (
-        renderResult.stderr ||
-        renderResult.stdout ||
-        ''
-      ).toString();
-      const errorMessage = formatSubprocessFailure(
-        renderOutput,
-        config.command,
-      );
-      notify(ctx, errorMessage, 'error');
-      return;
-    }
+      if (chunks.length > 1) {
+        notify(ctx, `Speaking chunk ${i + 1}/${chunks.length}...`, 'info');
+      }
 
-    // Then play the rendered WAV in the foreground so stopPlayback can reliably cancel it.
-    commandForError = 'ffplay';
-    const ffplayResult = await pi.exec(
-      'ffplay',
-      ['-nodisp', '-autoexit', '-loglevel', 'quiet', wavPath],
-      {signal: playbackController.signal},
-    );
+      wavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
+      const currentWavPath = wavPath;
 
-    if (playbackController.signal.aborted || ffplayResult.killed) {
-      return;
-    }
+      const wavArgs = [
+        ...config.args,
+        ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
+        '-m',
+        config.model,
+        ...config.extraArgs,
+        '-f',
+        currentWavPath,
+        '--',
+        chunkText,
+      ];
 
-    if (ffplayResult.code !== 0) {
-      const output = (
-        ffplayResult.stderr ||
-        ffplayResult.stdout ||
-        ''
-      ).toString();
-      const errorMessage = output
-        ? `ffplay failed with exit code ${ffplayResult.code}.\n\n--- stderr/stdout ---\n${output}`
-        : `ffplay failed with exit code ${ffplayResult.code}.`;
-      notify(ctx, errorMessage, 'error');
-      return;
+      // Helpful hint when debugging Piper configuration issues.
+      if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+        notify(
+          ctx,
+          `Piper config: command=${config.command} chunk=${i + 1}/${chunks.length} args=${JSON.stringify(wavArgs)}`,
+          'info',
+        );
+      }
+
+      try {
+        commandForError = config.command;
+        // eslint-disable-next-line no-await-in-loop
+        const renderResult = await pi.exec(config.command, wavArgs, {
+          signal: playbackController.signal,
+        });
+
+        if (playbackController.signal.aborted || renderResult.killed) {
+          return;
+        }
+
+        if (renderResult.code !== 0) {
+          const renderOutput = (
+            renderResult.stderr ||
+            renderResult.stdout ||
+            ''
+          ).toString();
+          const errorMessage = formatSubprocessFailure(
+            renderOutput,
+            config.command,
+          );
+          notify(ctx, errorMessage, 'error');
+          return;
+        }
+
+        // Then play the rendered WAV in the foreground so stopPlayback can reliably cancel it.
+        commandForError = 'ffplay';
+        // eslint-disable-next-line no-await-in-loop
+        const ffplayResult = await pi.exec(
+          'ffplay',
+          ['-nodisp', '-autoexit', '-loglevel', 'quiet', currentWavPath],
+          {signal: playbackController.signal},
+        );
+
+        if (playbackController.signal.aborted || ffplayResult.killed) {
+          return;
+        }
+
+        if (ffplayResult.code !== 0) {
+          const output = (
+            ffplayResult.stderr ||
+            ffplayResult.stdout ||
+            ''
+          ).toString();
+          const errorMessage = output
+            ? `ffplay failed with exit code ${ffplayResult.code}.\n\n--- stderr/stdout ---\n${output}`
+            : `ffplay failed with exit code ${ffplayResult.code}.`;
+          notify(ctx, errorMessage, 'error');
+          return;
+        }
+      } finally {
+        if (existsSync(currentWavPath)) {
+          try {
+            unlinkSync(currentWavPath);
+          } catch {
+            // best-effort cleanup
+          }
+        }
+
+        if (wavPath === currentWavPath) {
+          wavPath = undefined;
+        }
+      }
     }
 
     notify(ctx, 'Spoken latest assistant message.', 'info');
@@ -611,6 +789,7 @@ function debugDumpConfig(ctx: ExtensionContext, config: PiperConfig) {
     dataDir: config.dataDir,
     extraArgs: config.extraArgs,
     maxChars: config.maxChars,
+    chunkChars: config.chunkChars,
   };
 
   const message = `PIPER_PI_TTS_DEBUG=1 resolved config: ${JSON.stringify(payload)}`;
