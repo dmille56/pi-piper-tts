@@ -17,7 +17,8 @@
     "lint-fix": "xo --fix",
     "format": "prettier --write .",
     "check": "npm run typecheck && npm run lint",
-    "build": "echo 'nothing to build'",
+    "test": "rm -rf dist-test && tsc -p tsconfig.json --noEmit false --outDir dist-test && node --test dist-test/tts.test.js",
+    "build": "echo 'nothing to build'", 
     "release": "npm run check && npm version patch && npm publish --access public",
     "prepublishOnly": "npm run check"
   },

@@ -716,8 +716,9 @@ function extractSpokenText(content: unknown): string {
   return parts.join(' ');
 }
 
-function normalizeSpeechText(text: string): string {
-  return text.replaceAll(/\s+/g, ' ').trim();
+export function normalizeSpeechText(text: string): string {
+  // Strip Markdown-style double-asterisks so Piper doesn't pronounce them.
+  return text.replaceAll('**', '').replaceAll(/\s+/g, ' ').trim();
 }
 
 function truncateText(
