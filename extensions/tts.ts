@@ -37,7 +37,7 @@ const defaultPiperCommandArgs = ['-m', 'piper'];
 let activePlaybackController: AbortController | undefined;
 
 function notify(
-  ctx: ExtensionCommandContext,
+  ctx: ExtensionContext,
   message: string,
   level: 'info' | 'warning' | 'error' = 'info',
 ) {
@@ -126,7 +126,7 @@ function asRecordUnknown(value: unknown): Record<string, unknown> {
   return isRecordUnknown(value) ? value : {};
 }
 
-function getPiSettings(ctx: ExtensionCommandContext): Record<string, unknown> {
+function getPiSettings(ctx: ExtensionContext): Record<string, unknown> {
   const globalPath = join(homedir(), '.pi', 'agent', 'settings.json');
 
   let cwd = process.cwd();
@@ -213,8 +213,33 @@ function isTtsAliasEnabledAtLoad(): boolean {
   return isTtsAliasEnabledFromSettings(section);
 }
 
+function isAutoPlayEnabledFromSettings(
+  section: Record<string, unknown>,
+): boolean {
+  // Key name: `auto-play`.
+  const raw = section['auto-play'] ?? section.autoPlay;
+  const parsed = parseOptionalBoolean(raw);
+  return parsed ?? false;
+}
+
+function isAutoPlayEnabledAtLoad(): boolean {
+  const envRaw = process.env.PIPER_PI_AUTO_PLAY?.trim();
+  if (envRaw) {
+    const parsed = parseOptionalBoolean(envRaw);
+    return parsed ?? false;
+  }
+
+  const globalPath = join(homedir(), '.pi', 'agent', 'settings.json');
+  const projectPath = join(process.cwd(), '.pi', 'settings.json');
+  const globalSettings = asRecordUnknown(loadPiSettingsFile(globalPath));
+  const projectSettings = asRecordUnknown(loadPiSettingsFile(projectPath));
+  const settings = {...globalSettings, ...projectSettings};
+  const section = getSettingsSection(settings);
+  return isAutoPlayEnabledFromSettings(section);
+}
+
 function getConfig(
-  ctx: ExtensionCommandContext,
+  ctx: ExtensionContext,
 ): PiperConfig | {error: string} {
   const settings = getPiSettings(ctx);
   const section = getSettingsSection(settings);
@@ -305,6 +330,210 @@ function getConfig(
     extraArgs,
     maxChars,
   };
+}
+
+function isAbortError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  return (
+    error.name === 'AbortError' ||
+    /\baborted\b/i.test(error.message) ||
+    /\babort\b/i.test(error.message)
+  );
+}
+
+async function speakText(pi: ExtensionAPI, ctx: ExtensionContext, text: string) {
+  // Cancel any previous playback before starting a new one.
+  activePlaybackController?.abort();
+
+  const playbackController = new AbortController();
+  activePlaybackController = playbackController;
+
+  const cleanup = () => {
+    if (activePlaybackController === playbackController) {
+      activePlaybackController = undefined;
+    }
+  };
+
+  const onCtxAbort = () => {
+    playbackController.abort();
+  };
+
+  if (ctx.signal) {
+    if (ctx.signal.aborted) {
+      playbackController.abort();
+    } else {
+      ctx.signal.addEventListener('abort', onCtxAbort, {once: true});
+    }
+  }
+
+  let commandForError = 'piper';
+
+  try {
+    if (playbackController.signal.aborted) return;
+
+    const config = getConfig(ctx);
+    if ('error' in config) {
+      notify(ctx, config.error, 'error');
+      return;
+    }
+
+    if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+      debugDumpConfig(ctx, config);
+    }
+
+    commandForError = config.command;
+
+    let speechText = normalizeSpeechText(text);
+    if (!speechText) {
+      notify(ctx, 'Provided text contains no spoken text.', 'warning');
+      return;
+    }
+
+    if (config.maxChars && speechText.length > config.maxChars) {
+      const truncated = truncateText(speechText, config.maxChars);
+      speechText = truncated.text;
+      if (truncated.truncated) {
+        notify(
+          ctx,
+          `Latest assistant message was truncated to ${config.maxChars} characters for speech.`,
+          'warning',
+        );
+      }
+    }
+
+    // Validate model path early so we can show a precise error.
+    if (!existsSync(config.model)) {
+      notify(ctx, `Piper model file not found at: ${config.model}`, 'error');
+      return;
+    }
+
+    // Piper usually expects a sibling JSON config next to the ONNX.
+    const modelJsonPath = `${config.model}.json`;
+    if (!existsSync(modelJsonPath)) {
+      notify(
+        ctx,
+        `Piper voice config JSON not found at: ${modelJsonPath} (piper guesses this automatically).`,
+        'error',
+      );
+      return;
+    }
+
+    notify(ctx, 'Speaking latest assistant message...', 'info');
+
+    const args = [
+      ...config.args,
+      ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
+      '-m',
+      config.model,
+      ...config.extraArgs,
+      '--',
+      speechText,
+    ];
+
+    // Helpful hint when debugging Piper configuration issues.
+    if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+      notify(
+        ctx,
+        `Piper config: command=${config.command} args=${JSON.stringify(args)}`,
+        'info',
+      );
+    }
+
+    const result = await pi.exec(config.command, args, {
+      signal: playbackController.signal,
+    });
+    if (playbackController.signal.aborted) return;
+
+    if (result.code !== 0) {
+      const output = (result.stderr || result.stdout || '').toString();
+
+      // Piper uses ffplay for playback; for long utterances it can exceed
+      // Piper's internal 5s wait timeout and throw a TimeoutExpired.
+      if (
+        /ffplay/i.test(output) &&
+        /(timed out|timeoutexpired)/i.test(output)
+      ) {
+        notify(
+          ctx,
+          'Piper playback timed out; retrying by rendering WAV then playing it.',
+          'warning',
+        );
+
+        const wavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
+        const wavArgs = [
+          ...config.args,
+          ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
+          '-m',
+          config.model,
+          ...config.extraArgs,
+          '-f',
+          wavPath,
+          '--',
+          speechText,
+        ];
+
+        const renderResult = await pi.exec(config.command, wavArgs, {
+          signal: playbackController.signal,
+        });
+        if (playbackController.signal.aborted) return;
+
+        if (renderResult.code !== 0) {
+          const renderOutput = (
+            renderResult.stderr ||
+            renderResult.stdout ||
+            ''
+          ).toString();
+          const errorMessage = formatSubprocessFailure(
+            renderOutput,
+            config.command,
+          );
+          notify(ctx, errorMessage, 'error');
+          return;
+        }
+
+        // Play the generated WAV.
+        try {
+          const ffplayResult = await pi.exec(
+            'ffplay',
+            ['-nodisp', '-autoexit', '-loglevel', 'quiet', wavPath],
+            {signal: playbackController.signal},
+          );
+          if (playbackController.signal.aborted) return;
+
+          if (ffplayResult.code !== 0) {
+            notify(
+              ctx,
+              `ffplay failed with exit code ${ffplayResult.code}.`,
+              'error',
+            );
+            return;
+          }
+        } catch {
+          if (playbackController.signal.aborted) return;
+          notify(
+            ctx,
+            'ffplay failed. Is ffmpeg/ffplay installed and on PATH?',
+            'error',
+          );
+          return;
+        }
+
+        notify(ctx, 'Spoken latest assistant message.', 'info');
+        return;
+      }
+
+      const errorMessage = formatSubprocessFailure(output, config.command);
+      notify(ctx, errorMessage, 'error');
+      return;
+    }
+
+    notify(ctx, 'Spoken latest assistant message.', 'info');
+  } catch (error) {
+    if (playbackController.signal.aborted || isAbortError(error)) return;
+    notify(ctx, formatExecError(commandForError, error), 'error');
+  } finally {
+    cleanup();
+  }
 }
 
 function extractSpokenText(content: unknown): string {
@@ -399,7 +628,30 @@ function stopCurrentPlayback() {
   activePlaybackController?.abort();
 }
 
+function debugDumpConfig(ctx: ExtensionContext, config: PiperConfig) {
+  const payload = {
+    command: config.command,
+    args: config.args,
+    model: config.model,
+    dataDir: config.dataDir,
+    extraArgs: config.extraArgs,
+    maxChars: config.maxChars,
+  };
+
+  const message = `PIPER_PI_TTS_DEBUG=1 resolved config: ${JSON.stringify(payload)}`;
+  if (ctx.hasUI) notify(ctx, message, 'info');
+  else console.log(message);
+}
+
 export default function piperTtsExtension(pi: ExtensionAPI) {
+  const autoPlayEnabled = isAutoPlayEnabledAtLoad();
+  if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+    const msg = `PIPER_PI_TTS_DEBUG=1 autoPlayEnabled=${autoPlayEnabled}`;
+    console.log(msg);
+  }
+  let pendingAutoPlay: boolean = false;
+  let lastAutoPlayedMessageKey: string | undefined;
+
   pi.on('session_shutdown', () => {
     stopCurrentPlayback();
   });
@@ -429,223 +681,89 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
   pi.on('message_update', (event) => {
     if (event.message?.role === 'assistant') stopCurrentPlayback();
   });
-  const isAbortError = (error: unknown): boolean => {
-    if (!(error instanceof Error)) return false;
-    return (
-      error.name === 'AbortError' ||
-      /\baborted\b/i.test(error.message) ||
-      /\babort\b/i.test(error.message)
-    );
-  };
+
+  pi.on('input', (event) => {
+    if (!autoPlayEnabled) return;
+    if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+      const msg = `PIPER_PI_TTS_DEBUG=1 input arming check: source=${event.source} pendingAutoPlay=${pendingAutoPlay}`;
+      if (pi) console.log(msg);
+    }
+    if (
+      event.source === 'interactive' ||
+      event.source === 'rpc' ||
+      event.source === 'extension'
+    ) {
+      pendingAutoPlay = true;
+    }
+  });
+
+  pi.on('agent_end', async (event, ctx) => {
+    if (!autoPlayEnabled) return;
+    if (!pendingAutoPlay) return;
+    pendingAutoPlay = false;
+
+    if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+      const msg = `PIPER_PI_TTS_DEBUG=1 agent_end triggered: messages=${event.messages.length}`;
+      if (ctx.hasUI) notify(ctx, msg, 'info');
+      else console.log(msg);
+    }
+
+    const message = [...event.messages].reverse().find(m => m.role === 'assistant');
+    if (!message || message.role !== 'assistant') return;
+    if (message.stopReason === 'aborted' || message.stopReason === 'error') {
+      if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+        const msg = `PIPER_PI_TTS_DEBUG=1 skipping speech due to stopReason=${message.stopReason}`;
+        if (ctx.hasUI) notify(ctx, msg, 'info');
+        else console.log(msg);
+      }
+      return;
+    }
+
+    const messageKey = message.responseId ?? String(message.timestamp);
+    if (lastAutoPlayedMessageKey === messageKey) return;
+    lastAutoPlayedMessageKey = messageKey;
+
+    const text = normalizeSpeechText(extractSpokenText(message.content));
+    if (!text) {
+      if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+        const msg = 'PIPER_PI_TTS_DEBUG=1 skipping speech: no spoken text in assistant message';
+        if (ctx.hasUI) notify(ctx, msg, 'info');
+        else console.log(msg);
+      }
+      return;
+    }
+    
+    await speakText(pi, ctx, text);
+  });
 
   const speakLatestAssistant: ExtensionAPI['registerCommand'] extends (
     ...args: any[]
   ) => any
     ? (_args: unknown, ctx: ExtensionCommandContext) => Promise<void>
     : never = async (_args: unknown, ctx: ExtensionCommandContext) => {
-    // Cancel any previous playback before starting a new one.
-    activePlaybackController?.abort();
+    await ctx.waitForIdle();
 
-    const playbackController = new AbortController();
-    activePlaybackController = playbackController;
+    const branch = ctx.sessionManager.getBranch() as SessionEntry[];
+    const latestAssistant = findLatestAssistantMessage(branch);
 
-    const cleanup = () => {
-      if (activePlaybackController === playbackController) {
-        activePlaybackController = undefined;
-      }
-    };
-
-    const onCtxAbort = () => {
-      playbackController.abort();
-    };
-
-    if (ctx.signal) {
-      if (ctx.signal.aborted) {
-        playbackController.abort();
-      } else {
-        ctx.signal.addEventListener('abort', onCtxAbort, {once: true});
-      }
+    if (!latestAssistant) {
+      notify(ctx, 'No assistant message to speak yet.', 'warning');
+      return;
     }
 
-    let commandForError = 'piper';
-
-    try {
-      await ctx.waitForIdle();
-      if (playbackController.signal.aborted) return;
-
-      const config = getConfig(ctx);
-      if ('error' in config) {
-        notify(ctx, config.error, 'error');
-        return;
-      }
-
-      commandForError = config.command;
-
-      const branch = ctx.sessionManager.getBranch() as SessionEntry[];
-      const latestAssistant = findLatestAssistantMessage(branch);
-
-      if (!latestAssistant) {
-        notify(ctx, 'No assistant message to speak yet.', 'warning');
-        return;
-      }
-
-      let text = normalizeSpeechText(
-        extractSpokenText(latestAssistant.message?.content),
+    const text = normalizeSpeechText(
+      extractSpokenText(latestAssistant.message?.content),
+    );
+    if (!text) {
+      notify(
+        ctx,
+        'Latest assistant message contains no spoken text.',
+        'warning',
       );
-      if (!text) {
-        notify(
-          ctx,
-          'Latest assistant message contains no spoken text.',
-          'warning',
-        );
-        return;
-      }
-
-      if (config.maxChars && text.length > config.maxChars) {
-        const truncated = truncateText(text, config.maxChars);
-        text = truncated.text;
-        if (truncated.truncated) {
-          notify(
-            ctx,
-            `Latest assistant message was truncated to ${config.maxChars} characters for speech.`,
-            'warning',
-          );
-        }
-      }
-
-      // Validate model path early so we can show a precise error.
-      if (!existsSync(config.model)) {
-        notify(ctx, `Piper model file not found at: ${config.model}`, 'error');
-        return;
-      }
-
-      // Piper usually expects a sibling JSON config next to the ONNX.
-      const modelJsonPath = `${config.model}.json`;
-      if (!existsSync(modelJsonPath)) {
-        notify(
-          ctx,
-          `Piper voice config JSON not found at: ${modelJsonPath} (piper guesses this automatically).`,
-          'error',
-        );
-        return;
-      }
-
-      notify(ctx, 'Speaking latest assistant message...', 'info');
-
-      const args = [
-        ...config.args,
-        ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
-        '-m',
-        config.model,
-        ...config.extraArgs,
-        '--',
-        text,
-      ];
-
-      // Helpful hint when debugging Piper configuration issues.
-      if (process.env.PIPER_PI_TTS_DEBUG === '1') {
-        notify(
-          ctx,
-          `Piper config: command=${config.command} args=${JSON.stringify(args)}`,
-          'info',
-        );
-      }
-
-      const result = await pi.exec(config.command, args, {
-        signal: playbackController.signal,
-      });
-      if (playbackController.signal.aborted) return;
-
-      if (result.code !== 0) {
-        const output = (result.stderr || result.stdout || '').toString();
-
-        // Piper uses ffplay for playback; for long utterances it can exceed
-        // Piper's internal 5s wait timeout and throw a TimeoutExpired.
-        if (
-          /ffplay/i.test(output) &&
-          /(timed out|timeoutexpired)/i.test(output)
-        ) {
-          notify(
-            ctx,
-            'Piper playback timed out; retrying by rendering WAV then playing it.',
-            'warning',
-          );
-
-          const wavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
-          const wavArgs = [
-            ...config.args,
-            ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
-            '-m',
-            config.model,
-            ...config.extraArgs,
-            '-f',
-            wavPath,
-            '--',
-            text,
-          ];
-
-          const renderResult = await pi.exec(config.command, wavArgs, {
-            signal: playbackController.signal,
-          });
-          if (playbackController.signal.aborted) return;
-
-          if (renderResult.code !== 0) {
-            const renderOutput = (
-              renderResult.stderr ||
-              renderResult.stdout ||
-              ''
-            ).toString();
-            const errorMessage = formatSubprocessFailure(
-              renderOutput,
-              config.command,
-            );
-            notify(ctx, errorMessage, 'error');
-            return;
-          }
-
-          // Play the generated WAV.
-          try {
-            const ffplayResult = await pi.exec(
-              'ffplay',
-              ['-nodisp', '-autoexit', '-loglevel', 'quiet', wavPath],
-              {signal: playbackController.signal},
-            );
-            if (playbackController.signal.aborted) return;
-
-            if (ffplayResult.code !== 0) {
-              notify(
-                ctx,
-                `ffplay failed with exit code ${ffplayResult.code}.`,
-                'error',
-              );
-              return;
-            }
-          } catch {
-            if (playbackController.signal.aborted) return;
-            notify(
-              ctx,
-              'ffplay failed. Is ffmpeg/ffplay installed and on PATH?',
-              'error',
-            );
-            return;
-          }
-
-          notify(ctx, 'Spoken latest assistant message.', 'info');
-          return;
-        }
-
-        const errorMessage = formatSubprocessFailure(output, config.command);
-        notify(ctx, errorMessage, 'error');
-        return;
-      }
-
-      notify(ctx, 'Spoken latest assistant message.', 'info');
-    } catch (error) {
-      if (playbackController.signal.aborted || isAbortError(error)) return;
-      notify(ctx, formatExecError(commandForError, error), 'error');
-    } finally {
-      cleanup();
+      return;
     }
+
+    await speakText(pi, ctx, text);
   };
 
   const stopPlayback: ExtensionAPI['registerCommand'] extends (

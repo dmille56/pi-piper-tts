@@ -63,6 +63,7 @@ Set these environment variables before launching Pi:
 - `PIPER_PI_DATA_DIR` — optional. Passed to Piper as `--data-dir`
 - `PIPER_PI_EXTRA_ARGS` — optional extra arguments appended to the Piper command
 - `PIPER_PI_MAX_CHARS` — optional safety cap for long assistant messages (must be a positive integer)
+- `PIPER_PI_AUTO_PLAY` — optional. When truthy, auto-plays TTS after the agent finishes a user-triggered run.
 
 ### Pi settings (`settings.json`)
 
@@ -82,6 +83,7 @@ Keys in that section:
 - `piper-pi-data-dir` — same as `PIPER_PI_DATA_DIR`
 - `piper-pi-extra-args` — same as `PIPER_PI_EXTRA_ARGS`
 - `piper-pi-max-chars` — same as `PIPER_PI_MAX_CHARS`
+- `auto-play` — optional boolean. When true, auto-plays TTS after the agent finishes a user-triggered run.
 
 Pi loads settings from:
 
