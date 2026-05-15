@@ -1,8 +1,9 @@
 import {homedir, tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
-import {existsSync, readFileSync} from 'node:fs';
+import {existsSync, readFileSync, unlinkSync} from 'node:fs';
 import type {
+  AgentEndEvent,
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
@@ -238,9 +239,7 @@ function isAutoPlayEnabledAtLoad(): boolean {
   return isAutoPlayEnabledFromSettings(section);
 }
 
-function getConfig(
-  ctx: ExtensionContext,
-): PiperConfig | {error: string} {
+function getConfig(ctx: ExtensionContext): PiperConfig | {error: string} {
   const settings = getPiSettings(ctx);
   const section = getSettingsSection(settings);
 
@@ -341,7 +340,11 @@ function isAbortError(error: unknown): boolean {
   );
 }
 
-async function speakText(pi: ExtensionAPI, ctx: ExtensionContext, text: string) {
+async function speakText(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  text: string,
+) {
   // Cancel any previous playback before starting a new one.
   activePlaybackController?.abort();
 
@@ -367,6 +370,7 @@ async function speakText(pi: ExtensionAPI, ctx: ExtensionContext, text: string) 
   }
 
   let commandForError = 'piper';
+  let wavPath: string | undefined;
 
   try {
     if (playbackController.signal.aborted) return;
@@ -380,8 +384,6 @@ async function speakText(pi: ExtensionAPI, ctx: ExtensionContext, text: string) 
     if (process.env.PIPER_PI_TTS_DEBUG === '1') {
       debugDumpConfig(ctx, config);
     }
-
-    commandForError = config.command;
 
     let speechText = normalizeSpeechText(text);
     if (!speechText) {
@@ -420,12 +422,17 @@ async function speakText(pi: ExtensionAPI, ctx: ExtensionContext, text: string) 
 
     notify(ctx, 'Speaking latest assistant message...', 'info');
 
-    const args = [
+    // Always render to a temporary WAV first.
+    wavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
+
+    const wavArgs = [
       ...config.args,
       ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
       '-m',
       config.model,
       ...config.extraArgs,
+      '-f',
+      wavPath,
       '--',
       speechText,
     ];
@@ -434,95 +441,55 @@ async function speakText(pi: ExtensionAPI, ctx: ExtensionContext, text: string) 
     if (process.env.PIPER_PI_TTS_DEBUG === '1') {
       notify(
         ctx,
-        `Piper config: command=${config.command} args=${JSON.stringify(args)}`,
+        `Piper config: command=${config.command} args=${JSON.stringify(wavArgs)}`,
         'info',
       );
     }
 
-    const result = await pi.exec(config.command, args, {
+    commandForError = config.command;
+    const renderResult = await pi.exec(config.command, wavArgs, {
       signal: playbackController.signal,
     });
-    if (playbackController.signal.aborted) return;
 
-    if (result.code !== 0) {
-      const output = (result.stderr || result.stdout || '').toString();
+    if (playbackController.signal.aborted || renderResult.killed) {
+      return;
+    }
 
-      // Piper uses ffplay for playback; for long utterances it can exceed
-      // Piper's internal 5s wait timeout and throw a TimeoutExpired.
-      if (
-        /ffplay/i.test(output) &&
-        /(timed out|timeoutexpired)/i.test(output)
-      ) {
-        notify(
-          ctx,
-          'Piper playback timed out; retrying by rendering WAV then playing it.',
-          'warning',
-        );
+    if (renderResult.code !== 0) {
+      const renderOutput = (
+        renderResult.stderr ||
+        renderResult.stdout ||
+        ''
+      ).toString();
+      const errorMessage = formatSubprocessFailure(
+        renderOutput,
+        config.command,
+      );
+      notify(ctx, errorMessage, 'error');
+      return;
+    }
 
-        const wavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
-        const wavArgs = [
-          ...config.args,
-          ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
-          '-m',
-          config.model,
-          ...config.extraArgs,
-          '-f',
-          wavPath,
-          '--',
-          speechText,
-        ];
+    // Then play the rendered WAV in the foreground so stopPlayback can reliably cancel it.
+    commandForError = 'ffplay';
+    const ffplayResult = await pi.exec(
+      'ffplay',
+      ['-nodisp', '-autoexit', '-loglevel', 'quiet', wavPath],
+      {signal: playbackController.signal},
+    );
 
-        const renderResult = await pi.exec(config.command, wavArgs, {
-          signal: playbackController.signal,
-        });
-        if (playbackController.signal.aborted) return;
+    if (playbackController.signal.aborted || ffplayResult.killed) {
+      return;
+    }
 
-        if (renderResult.code !== 0) {
-          const renderOutput = (
-            renderResult.stderr ||
-            renderResult.stdout ||
-            ''
-          ).toString();
-          const errorMessage = formatSubprocessFailure(
-            renderOutput,
-            config.command,
-          );
-          notify(ctx, errorMessage, 'error');
-          return;
-        }
-
-        // Play the generated WAV.
-        try {
-          const ffplayResult = await pi.exec(
-            'ffplay',
-            ['-nodisp', '-autoexit', '-loglevel', 'quiet', wavPath],
-            {signal: playbackController.signal},
-          );
-          if (playbackController.signal.aborted) return;
-
-          if (ffplayResult.code !== 0) {
-            notify(
-              ctx,
-              `ffplay failed with exit code ${ffplayResult.code}.`,
-              'error',
-            );
-            return;
-          }
-        } catch {
-          if (playbackController.signal.aborted) return;
-          notify(
-            ctx,
-            'ffplay failed. Is ffmpeg/ffplay installed and on PATH?',
-            'error',
-          );
-          return;
-        }
-
-        notify(ctx, 'Spoken latest assistant message.', 'info');
-        return;
-      }
-
-      const errorMessage = formatSubprocessFailure(output, config.command);
+    if (ffplayResult.code !== 0) {
+      const output = (
+        ffplayResult.stderr ||
+        ffplayResult.stdout ||
+        ''
+      ).toString();
+      const errorMessage = output
+        ? `ffplay failed with exit code ${ffplayResult.code}.\n\n--- stderr/stdout ---\n${output}`
+        : `ffplay failed with exit code ${ffplayResult.code}.`;
       notify(ctx, errorMessage, 'error');
       return;
     }
@@ -533,6 +500,14 @@ async function speakText(pi: ExtensionAPI, ctx: ExtensionContext, text: string) 
     notify(ctx, formatExecError(commandForError, error), 'error');
   } finally {
     cleanup();
+
+    if (wavPath && existsSync(wavPath)) {
+      try {
+        unlinkSync(wavPath);
+      } catch {
+        // best-effort cleanup
+      }
+    }
   }
 }
 
@@ -646,10 +621,11 @@ function debugDumpConfig(ctx: ExtensionContext, config: PiperConfig) {
 export default function piperTtsExtension(pi: ExtensionAPI) {
   const autoPlayEnabled = isAutoPlayEnabledAtLoad();
   if (process.env.PIPER_PI_TTS_DEBUG === '1') {
-    const msg = `PIPER_PI_TTS_DEBUG=1 autoPlayEnabled=${autoPlayEnabled}`;
-    console.log(msg);
+    const debugMessage = `PIPER_PI_TTS_DEBUG=1 autoPlayEnabled=${autoPlayEnabled}`;
+    console.log(debugMessage);
   }
-  let pendingAutoPlay: boolean = false;
+
+  let pendingAutoPlay = false;
   let lastAutoPlayedMessageKey: string | undefined;
 
   pi.on('session_shutdown', () => {
@@ -685,9 +661,10 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
   pi.on('input', (event) => {
     if (!autoPlayEnabled) return;
     if (process.env.PIPER_PI_TTS_DEBUG === '1') {
-      const msg = `PIPER_PI_TTS_DEBUG=1 input arming check: source=${event.source} pendingAutoPlay=${pendingAutoPlay}`;
-      if (pi) console.log(msg);
+      const debugMessage = `PIPER_PI_TTS_DEBUG=1 input arming check: source=${event.source} pendingAutoPlay=${pendingAutoPlay}`;
+      if (pi) console.log(debugMessage);
     }
+
     if (
       event.source === 'interactive' ||
       event.source === 'rpc' ||
@@ -697,25 +674,29 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
     }
   });
 
-  pi.on('agent_end', async (event, ctx) => {
+  pi.on('agent_end', async (event: AgentEndEvent, ctx) => {
     if (!autoPlayEnabled) return;
     if (!pendingAutoPlay) return;
     pendingAutoPlay = false;
 
     if (process.env.PIPER_PI_TTS_DEBUG === '1') {
-      const msg = `PIPER_PI_TTS_DEBUG=1 agent_end triggered: messages=${event.messages.length}`;
-      if (ctx.hasUI) notify(ctx, msg, 'info');
-      else console.log(msg);
+      const debugMessage = `PIPER_PI_TTS_DEBUG=1 agent_end triggered: messages=${event.messages.length}`;
+      if (ctx.hasUI) notify(ctx, debugMessage, 'info');
+      else console.log(debugMessage);
     }
 
-    const message = [...event.messages].reverse().find(m => m.role === 'assistant');
-    if (!message || message.role !== 'assistant') return;
+    const message = [...event.messages]
+      // eslint-disable-next-line unicorn/no-array-reverse
+      .reverse()
+      .find((m) => m.role === 'assistant');
+    if (message?.role !== 'assistant') return;
     if (message.stopReason === 'aborted' || message.stopReason === 'error') {
       if (process.env.PIPER_PI_TTS_DEBUG === '1') {
-        const msg = `PIPER_PI_TTS_DEBUG=1 skipping speech due to stopReason=${message.stopReason}`;
-        if (ctx.hasUI) notify(ctx, msg, 'info');
-        else console.log(msg);
+        const debugMessage = `PIPER_PI_TTS_DEBUG=1 skipping speech due to stopReason=${message.stopReason}`;
+        if (ctx.hasUI) notify(ctx, debugMessage, 'info');
+        else console.log(debugMessage);
       }
+
       return;
     }
 
@@ -726,13 +707,15 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
     const text = normalizeSpeechText(extractSpokenText(message.content));
     if (!text) {
       if (process.env.PIPER_PI_TTS_DEBUG === '1') {
-        const msg = 'PIPER_PI_TTS_DEBUG=1 skipping speech: no spoken text in assistant message';
-        if (ctx.hasUI) notify(ctx, msg, 'info');
-        else console.log(msg);
+        const debugMessage =
+          'PIPER_PI_TTS_DEBUG=1 skipping speech: no spoken text in assistant message';
+        if (ctx.hasUI) notify(ctx, debugMessage, 'info');
+        else console.log(debugMessage);
       }
+
       return;
     }
-    
+
     await speakText(pi, ctx, text);
   });
 
