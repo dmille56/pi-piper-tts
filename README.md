@@ -16,23 +16,24 @@ It:
 
 ## Install
 
+Install from npm:
+
+```bash
+pi install npm:@dmille56/pi-piper-tts
+```
+
+Or pin a version:
+
+```bash
+pi install npm:@dmille56/pi-piper-tts@0.1.0
+```
+
 Install from a local path while developing:
 
 ```bash
 pi install /absolute/path/to/pi-piper-tts
 ```
 
-Once published to npm, install it like this:
-
-```bash
-pi install npm:pi-piper-tts
-```
-
-Or pin a version:
-
-```bash
-pi install npm:pi-piper-tts@0.1.0
-```
 
 ## Requirements
 

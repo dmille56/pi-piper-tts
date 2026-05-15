@@ -26,6 +26,14 @@
     "README.md",
     "LICENSE"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dmille56/pi-piper-tts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dmille56/pi-piper-tts/issues"
+  },
+  "homepage": "https://github.com/dmille56/pi-piper-tts#readme",
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
