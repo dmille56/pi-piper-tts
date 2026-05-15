@@ -1,5 +1,5 @@
 {
-  "name": "pi-piper-tts",
+  "name": "@dmille56/pi-piper-tts",
   "version": "0.1.0",
   "description": "A Pi package that adds a /piper-tts command (and /tts alias) for speaking the latest assistant message with Piper TTS.",
   "type": "module",

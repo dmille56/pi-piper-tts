@@ -40,6 +40,8 @@ pi install npm:pi-piper-tts@0.1.0
 - Python 3
 - **Piper (piper-tts) installed locally**:
 
+Up-to-date install/docs: https://github.com/OHF-Voice/piper1-gpl
+
 ```bash
 pip install piper-tts
 ```
