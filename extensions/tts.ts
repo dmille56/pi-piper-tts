@@ -1,6 +1,7 @@
 import {homedir, tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
+import {performance} from 'node:perf_hooks';
 import {existsSync, readFileSync, unlinkSync, writeFileSync} from 'node:fs';
 import type {
   AgentEndEvent,
@@ -139,6 +140,7 @@ function expandPath(value: string, baseDir: string): string {
   if (v.startsWith('./') || v.startsWith('../') || v.startsWith('.')) {
     return join(baseDir, v);
   }
+
   if (!v.includes('/') && !v.includes('\\')) {
     // Bare filename: treat it as relative to baseDir (matches kokoro/piper CLIs).
     return join(baseDir, v);
@@ -198,9 +200,7 @@ type LoadedTtsSettings = {
   legacySection?: string;
 };
 
-function loadTtsSettingsSection(
-  s: Record<string, unknown>,
-): LoadedTtsSettings {
+function loadTtsSettingsSection(s: Record<string, unknown>): LoadedTtsSettings {
   const canonical = s['pi-tts'];
   if (isRecordUnknown(canonical)) {
     return {section: canonical};
@@ -222,7 +222,9 @@ function loadTtsSettingsSection(
   return {section: {}};
 }
 
-function getSettingsSection(s: Record<string, unknown>): Record<string, unknown> {
+function getSettingsSection(
+  s: Record<string, unknown>,
+): Record<string, unknown> {
   return loadTtsSettingsSection(s).section;
 }
 
@@ -255,7 +257,8 @@ function isTtsAliasEnabledFromSettings(
   section: Record<string, unknown>,
 ): boolean {
   const raw =
-    section['enable-alias'] ?? section.enableAlias ??
+    section['enable-alias'] ??
+    section.enableAlias ??
     section['enable-tts-alias'] ??
     section.enableTtsAlias;
   const parsed = parseOptionalBoolean(raw);
@@ -278,7 +281,7 @@ function isTtsAliasEnabledAtLoad(): boolean {
   const globalSettings = asRecordUnknown(loadPiSettingsFile(globalPath));
   const projectSettings = asRecordUnknown(loadPiSettingsFile(projectPath));
   const settings = {...globalSettings, ...projectSettings};
-  const section = loadTtsSettingsSection(settings).section;
+  const {section} = loadTtsSettingsSection(settings);
   return isTtsAliasEnabledFromSettings(section);
 }
 
@@ -305,7 +308,7 @@ function isAutoPlayEnabledAtLoad(): boolean {
   const globalSettings = asRecordUnknown(loadPiSettingsFile(globalPath));
   const projectSettings = asRecordUnknown(loadPiSettingsFile(projectPath));
   const settings = {...globalSettings, ...projectSettings};
-  const section = loadTtsSettingsSection(settings).section;
+  const {section} = loadTtsSettingsSection(settings);
   return isAutoPlayEnabledFromSettings(section);
 }
 
@@ -330,14 +333,14 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
     const raw = process.env[name];
     if (typeof raw !== 'string') return undefined;
     const trimmed = raw.trim();
-    return trimmed ? trimmed : undefined;
+    return trimmed || undefined;
   };
 
   const sectionTrim = (key: string): string | undefined => {
     const raw = section[key];
     if (typeof raw !== 'string') return undefined;
     const trimmed = raw.trim();
-    return trimmed ? trimmed : undefined;
+    return trimmed || undefined;
   };
 
   // Deprecation warnings (one-time per extension load).
@@ -383,15 +386,19 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
 
   let backend: TtsBackend = 'piper';
   if (backendEnvCanonical) {
-    backend = backendEnvCanonical.toLowerCase() === 'kokoro' ? 'kokoro' : 'piper';
+    backend =
+      backendEnvCanonical.toLowerCase() === 'kokoro' ? 'kokoro' : 'piper';
   } else if (backendFromCanonicalSettings) {
     backend =
-      backendFromCanonicalSettings.toLowerCase() === 'kokoro' ? 'kokoro' : 'piper';
+      backendFromCanonicalSettings.toLowerCase() === 'kokoro'
+        ? 'kokoro'
+        : 'piper';
   } else if (backendFromLegacySettings) {
     pushWarning(
       'Deprecated TTS settings key used for backend: tts-backend. Use settings.json key "backend" under "pi-tts" instead.',
     );
-    backend = backendFromLegacySettings.toLowerCase() === 'kokoro' ? 'kokoro' : 'piper';
+    backend =
+      backendFromLegacySettings.toLowerCase() === 'kokoro' ? 'kokoro' : 'piper';
   } else if (backendEnvLegacy) {
     pushWarning(
       'Deprecated TTS env var used for backend: PIPER_PI_TTS_BACKEND. Use PI_TTS_BACKEND instead.',
@@ -487,7 +494,9 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
         : defaultChunkChars;
 
   // Renderer bin/args
-  const parseBin = (binSpec: string): {command: string; args: string[]} | {error: string} => {
+  const parseBin = (
+    binSpec: string,
+  ): {command: string; args: string[]} | {error: string} => {
     const binParts = parseCommandLine(binSpec);
     if (binParts.length === 0) return {error: 'TTS bin spec is empty.'};
     const command = binParts[0];
@@ -503,11 +512,15 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
       sectionTrim('kokoro-tts-bin') ??
       'kokoro-tts';
 
-    if (binSpec === envTrim('KOKORO_PI_BIN') && envTrim('PI_TTS_BIN') === undefined) {
+    if (
+      binSpec === envTrim('KOKORO_PI_BIN') &&
+      envTrim('PI_TTS_BIN') === undefined
+    ) {
       pushWarning(
         'Deprecated TTS env var used: KOKORO_PI_BIN. Use PI_TTS_BIN instead.',
       );
     }
+
     if (
       binSpec === sectionTrim('kokoro-tts-bin') &&
       envTrim('PI_TTS_BIN') === undefined &&
@@ -539,6 +552,7 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
         'Deprecated TTS env var used: KOKORO_PI_MODEL. Use PI_TTS_MODEL instead.',
       );
     }
+
     if (
       modelRaw === sectionTrim('kokoro-tts-model') &&
       envTrim('PI_TTS_MODEL') === undefined &&
@@ -564,6 +578,7 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
         'Deprecated TTS env var used: KOKORO_PI_VOICES. Use PI_TTS_VOICES instead.',
       );
     }
+
     if (
       voicesRaw === sectionTrim('kokoro-tts-voices') &&
       envTrim('PI_TTS_VOICES') === undefined &&
@@ -583,6 +598,7 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
           'Missing Kokoro model. Set PI_TTS_MODEL (env) or settings.json "model" under "pi-tts".',
       };
     }
+
     if (!voicesPath) {
       maybeWarnOnce();
       return {
@@ -652,11 +668,18 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
           'Deprecated TTS env var used: KOKORO_PI_EXTRA_ARGS. Use PI_TTS_EXTRA_ARGS instead.',
         );
       }
-      if (!extraEnv && !extraFromSection && !extraLegacyEnv && extraLegacySection) {
+
+      if (
+        !extraEnv &&
+        !extraFromSection &&
+        !extraLegacyEnv &&
+        extraLegacySection
+      ) {
         pushWarning(
           'Deprecated TTS settings key used: kokoro-tts-extra-args. Use settings.json key "extra-args" under "pi-tts" instead.',
         );
       }
+
       extraArgs.push(...parseCommandLine(extraSpec));
     }
 
@@ -668,8 +691,8 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
       args: binResolved.args,
       modelPath,
       voicesPath,
-      lang: lang || undefined,
-      voice: voice || undefined,
+      lang,
+      voice,
       speed,
       extraArgs,
       maxChars,
@@ -685,9 +708,15 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
     sectionTrim('piper-pi-bin') ??
     defaultPiperCommand;
 
-  if (binSpec === envTrim('PIPER_PI_BIN') && envTrim('PI_TTS_BIN') === undefined) {
-    pushWarning('Deprecated TTS env var used: PIPER_PI_BIN. Use PI_TTS_BIN instead.');
+  if (
+    binSpec === envTrim('PIPER_PI_BIN') &&
+    envTrim('PI_TTS_BIN') === undefined
+  ) {
+    pushWarning(
+      'Deprecated TTS env var used: PIPER_PI_BIN. Use PI_TTS_BIN instead.',
+    );
   }
+
   if (
     binSpec === sectionTrim('piper-pi-bin') &&
     envTrim('PI_TTS_BIN') === undefined &&
@@ -710,7 +739,11 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
     envTrim('PIPER_PI_MODEL') ??
     sectionTrim('piper-pi-model') ??
     '';
-  if (modelRaw === envTrim('PIPER_PI_MODEL') && envTrim('PI_TTS_MODEL') === undefined && sectionTrim('model') === undefined) {
+  if (
+    modelRaw === envTrim('PIPER_PI_MODEL') &&
+    envTrim('PI_TTS_MODEL') === undefined &&
+    sectionTrim('model') === undefined
+  ) {
     pushWarning(
       'Deprecated TTS env var used: PIPER_PI_MODEL. Use PI_TTS_MODEL instead.',
     );
@@ -720,7 +753,8 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
   if (!model) {
     maybeWarnOnce();
     return {
-      error: 'Missing Piper model. Set PI_TTS_MODEL (env) or settings.json "model" under "pi-tts".',
+      error:
+        'Missing Piper model. Set PI_TTS_MODEL (env) or settings.json "model" under "pi-tts".',
     };
   }
 
@@ -747,17 +781,14 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
   const extraLegacyEnv = envTrim('PIPER_PI_EXTRA_ARGS');
   const extraLegacySection = sectionTrim('piper-pi-extra-args');
   const extraSpec =
-    extraEnv ??
-    extraFromSection ??
-    extraLegacyEnv ??
-    extraLegacySection ??
-    '';
+    extraEnv ?? extraFromSection ?? extraLegacyEnv ?? extraLegacySection ?? '';
 
   if (extraSpec && !extraEnv && !extraFromSection && extraLegacyEnv) {
     pushWarning(
       'Deprecated TTS env var used: PIPER_PI_EXTRA_ARGS. Use PI_TTS_EXTRA_ARGS instead.',
     );
   }
+
   if (
     extraSpec &&
     !extraEnv &&
@@ -773,7 +804,10 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
   const extraArgs = extraSpec ? parseCommandLine(extraSpec) : [];
 
   // Back-compat: if runner was only the python command, use the old default args.
-  if (binResolved.command === defaultPiperCommand && binResolved.args.length === 0) {
+  if (
+    binResolved.command === defaultPiperCommand &&
+    binResolved.args.length === 0
+  ) {
     binResolved.args.push(...defaultPiperCommandArgs);
   }
 
@@ -908,6 +942,762 @@ function splitSpeechIntoChunks(text: string, chunkChars: number): string[] {
   return chunks.length > 0 ? chunks : [text];
 }
 
+type HandledTtsError = Error & {handled: true};
+
+function isHandledTtsError(error: unknown): error is HandledTtsError {
+  if (!(error instanceof Error)) return false;
+
+  const handled: unknown = Reflect.get(error, 'handled');
+  return handled === true;
+}
+
+function debugEnabled(): boolean {
+  return process.env.PIPER_PI_TTS_DEBUG === '1';
+}
+
+function debugNotify(
+  ctx: ExtensionContext,
+  message: string,
+  level: 'info' | 'warning' | 'error' = 'info',
+) {
+  if (!debugEnabled()) return;
+  if (ctx.hasUI) notify(ctx, message, level);
+  else console.log(message);
+}
+
+export function removeStreamFlagFromArgs(args: string[]): string[] {
+  return args.filter((a) => {
+    if (a === '--stream') return false;
+    if (a.startsWith('--stream=')) return false;
+    return true;
+  });
+}
+
+type KokoroRenderStrategy = 'save-no-play' | 'save' | 'positional-output';
+
+type KokoroRenderSupport =
+  | {supported: false; reason: string; helpSnippet?: string}
+  | {
+      supported: true;
+      strategy: KokoroRenderStrategy;
+      helpSnippet?: string;
+    };
+
+const kokoroRenderSupportCache = new Map<string, KokoroRenderSupport>();
+
+async function detectKokoroRenderSupport(
+  pi: ExtensionAPI,
+  config: KokoroConfig,
+): Promise<KokoroRenderSupport> {
+  const cacheKey = `${config.command}`;
+  const cached = kokoroRenderSupportCache.get(cacheKey);
+  if (cached) return cached;
+
+  let helpText = '';
+  try {
+    // Some CLIs accept only `-h`.
+    const responseHelp = await pi.exec(config.command, ['--help'], {
+      timeout: 15_000,
+    });
+    helpText = `${responseHelp.stdout}\n${responseHelp.stderr}`;
+
+    if (!helpText.trim()) {
+      const responseH = await pi.exec(config.command, ['-h'], {
+        timeout: 15_000,
+      });
+      helpText = `${responseH.stdout}\n${responseH.stderr}`;
+    }
+  } catch {
+    // If probing fails, we’ll treat it as unsupported and fall back.
+  }
+
+  const lower = helpText.toLowerCase();
+  const hasSave = lower.includes('--save');
+  const hasNoPlay = lower.includes('--no-play');
+  const hasStream = lower.includes('--stream');
+  const hasOutputToken =
+    /\boutput\b/i.test(helpText) || /\bout\b/i.test(helpText);
+
+  let support: KokoroRenderSupport;
+
+  if (hasSave) {
+    support = {
+      supported: true,
+      strategy: hasNoPlay ? 'save-no-play' : 'save',
+      helpSnippet: helpText.slice(0, 800),
+    };
+  } else if (hasStream && hasOutputToken) {
+    support = {
+      supported: true,
+      strategy: 'positional-output',
+      helpSnippet: helpText.slice(0, 800),
+    };
+  } else {
+    support = {
+      supported: false,
+      reason:
+        'Could not detect Kokoro render-to-file flags for this kokoro-tts CLI.',
+      helpSnippet: helpText.slice(0, 800),
+    };
+  }
+
+  kokoroRenderSupportCache.set(cacheKey, support);
+  return support;
+}
+
+async function renderPiperChunkToWav(parameters: {
+  pi: ExtensionAPI;
+  ctx: ExtensionContext;
+  config: Extract<TtsConfig, {backend: 'piper'}>;
+  chunkText: string;
+  chunkIndex: number;
+  totalChunks: number;
+  playbackController: AbortController;
+  renderStartTimes: number[];
+  renderEndTimes: number[];
+}): Promise<
+  {status: 'ok'; wavPath: string} | {status: 'aborted'} | {status: 'error'}
+> {
+  const {
+    pi,
+    ctx,
+    config,
+    chunkText,
+    chunkIndex,
+    totalChunks,
+    playbackController,
+    renderStartTimes,
+    renderEndTimes,
+  } = parameters;
+
+  const wavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
+
+  const wavArgs = [
+    ...config.args,
+    ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
+    '-m',
+    config.model,
+    ...config.extraArgs,
+    '-f',
+    wavPath,
+    '--',
+    chunkText,
+  ];
+
+  if (debugEnabled()) {
+    debugNotify(
+      ctx,
+      `Piper render (chunk ${chunkIndex + 1}/${totalChunks}): command=${config.command} args=${JSON.stringify(wavArgs)}`,
+    );
+  }
+
+  renderStartTimes[chunkIndex] = performance.now();
+  let renderResult: Awaited<ReturnType<ExtensionAPI['exec']>>;
+  try {
+    renderResult = await pi.exec(config.command, wavArgs, {
+      signal: playbackController.signal,
+    });
+  } finally {
+    renderEndTimes[chunkIndex] = performance.now();
+  }
+
+  if (playbackController.signal.aborted || renderResult.killed) {
+    try {
+      if (existsSync(wavPath)) unlinkSync(wavPath);
+    } catch {
+      // best-effort cleanup
+    }
+
+    return {status: 'aborted'};
+  }
+
+  if (renderResult.code !== 0) {
+    const renderOutput =
+      `${renderResult.stderr}\n${renderResult.stdout}`.trim();
+    const errorMessage = formatSubprocessFailure(
+      renderOutput,
+      config.command,
+      'piper',
+    );
+    notify(ctx, errorMessage, 'error');
+
+    try {
+      if (existsSync(wavPath)) unlinkSync(wavPath);
+    } catch {
+      // best-effort cleanup
+    }
+
+    return {status: 'error'};
+  }
+
+  return {status: 'ok', wavPath};
+}
+
+/* eslint-disable no-await-in-loop */
+async function speakPiperChunks(parameters: {
+  pi: ExtensionAPI;
+  ctx: ExtensionContext;
+  config: Extract<TtsConfig, {backend: 'piper'}>;
+  chunks: string[];
+  playbackController: AbortController;
+}): Promise<boolean> {
+  const {pi, ctx, config, chunks, playbackController} = parameters;
+
+  const renderStartTimes: number[] = Array.from(
+    {length: chunks.length},
+    () => 0,
+  );
+  const renderEndTimes: number[] = Array.from({length: chunks.length}, () => 0);
+  const playStartTimes: number[] = Array.from({length: chunks.length}, () => 0);
+  const playEndTimes: number[] = Array.from({length: chunks.length}, () => 0);
+
+  const renderedWavs = new Set<string>();
+
+  try {
+    if (chunks.length === 0) return true;
+
+    let nextRenderPromise:
+      | Promise<
+          | {status: 'ok'; wavPath: string}
+          | {status: 'aborted'}
+          | {status: 'error'}
+        >
+      | undefined;
+
+    nextRenderPromise = renderPiperChunkToWav({
+      pi,
+      ctx,
+      config,
+      chunkText: chunks[0],
+      chunkIndex: 0,
+      totalChunks: chunks.length,
+      playbackController,
+      renderStartTimes,
+      renderEndTimes,
+    });
+
+    for (let i = 0; i < chunks.length; i++) {
+      if (playbackController.signal.aborted) return false;
+
+      const renderResult = await (nextRenderPromise as Promise<
+        | {status: 'ok'; wavPath: string}
+        | {status: 'aborted'}
+        | {status: 'error'}
+      >);
+
+      if (
+        playbackController.signal.aborted ||
+        renderResult.status === 'aborted'
+      ) {
+        return false;
+      }
+
+      if (renderResult.status === 'error') {
+        return false;
+      }
+
+      const currentWavPath = renderResult.wavPath;
+      renderedWavs.add(currentWavPath);
+
+      if (i + 1 < chunks.length && !playbackController.signal.aborted) {
+        debugNotify(
+          ctx,
+          `started rendering chunk ${i + 2}/${chunks.length} during playback of chunk ${i + 1}/${chunks.length}`,
+        );
+        nextRenderPromise = renderPiperChunkToWav({
+          pi,
+          ctx,
+          config,
+          chunkText: chunks[i + 1],
+          chunkIndex: i + 1,
+          totalChunks: chunks.length,
+          playbackController,
+          renderStartTimes,
+          renderEndTimes,
+        });
+      }
+
+      if (chunks.length > 1) {
+        notify(ctx, `Speaking chunk ${i + 1}/${chunks.length}...`, 'info');
+      }
+
+      if (debugEnabled()) {
+        debugNotify(ctx, `play start (chunk ${i + 1}/${chunks.length})`);
+      }
+
+      playStartTimes[i] = performance.now();
+
+      const ffplayResult = await pi.exec(
+        'ffplay',
+        ['-nodisp', '-autoexit', '-loglevel', 'quiet', currentWavPath],
+        {signal: playbackController.signal},
+      );
+
+      playEndTimes[i] = performance.now();
+
+      if (playbackController.signal.aborted || ffplayResult.killed) {
+        return false;
+      }
+
+      if (ffplayResult.code !== 0) {
+        const output = `${ffplayResult.stderr}\n${ffplayResult.stdout}`.trim();
+        const errorMessage = output
+          ? `ffplay failed with exit code ${ffplayResult.code}.\n\n--- stderr/stdout ---\n${output}`
+          : `ffplay failed with exit code ${ffplayResult.code}.`;
+        notify(ctx, errorMessage, 'error');
+        return false;
+      }
+
+      if (i + 1 < chunks.length && renderStartTimes[i + 1]) {
+        const gapMs = renderStartTimes[i + 1] - playEndTimes[i];
+        if (debugEnabled()) {
+          debugNotify(
+            ctx,
+            `gap between chunk ${i + 1} play end and chunk ${i + 2} render start: ${gapMs.toFixed(
+              1,
+            )}ms (negative means overlap)`,
+          );
+          debugNotify(
+            ctx,
+            `render duration chunk ${i + 1}: ${(renderEndTimes[i] - renderStartTimes[i]).toFixed(1)}ms; play duration: ${(playEndTimes[i] - playStartTimes[i]).toFixed(1)}ms`,
+          );
+        }
+      }
+
+      // Cleanup wav after playback.
+      try {
+        if (existsSync(currentWavPath)) unlinkSync(currentWavPath);
+      } catch {
+        // best-effort cleanup
+      }
+
+      renderedWavs.delete(currentWavPath);
+
+      debugNotify(ctx, `play end (chunk ${i + 1}/${chunks.length})`);
+    }
+
+    return true;
+  } finally {
+    for (const wavPath of renderedWavs) {
+      try {
+        if (existsSync(wavPath)) unlinkSync(wavPath);
+      } catch {
+        // best-effort cleanup
+      }
+    }
+  }
+}
+
+/* eslint-enable no-await-in-loop */
+
+async function renderKokoroChunkToWav(parameters: {
+  pi: ExtensionAPI;
+  ctx: ExtensionContext;
+  config: Extract<TtsConfig, {backend: 'kokoro'}>;
+  chunkText: string;
+  chunkIndex: number;
+  totalChunks: number;
+  playbackController: AbortController;
+  wavPath: string;
+  renderStartTimes: number[];
+  renderEndTimes: number[];
+  strategy: KokoroRenderStrategy;
+}): Promise<
+  {status: 'ok'; wavPath: string} | {status: 'aborted'} | {status: 'error'}
+> {
+  const {
+    pi,
+    ctx,
+    config,
+    chunkText,
+    chunkIndex,
+    totalChunks,
+    playbackController,
+    wavPath,
+    renderStartTimes,
+    renderEndTimes,
+    strategy,
+  } = parameters;
+
+  const currentInputPath = join(tmpdir(), `pi-tts-${randomUUID()}.txt`);
+
+  writeFileSync(currentInputPath, chunkText, 'utf8');
+
+  const kokoroVoice = config.voice ?? 'af_sarah';
+
+  // Always sanitize `--stream` for render-only mode.
+  const sanitizedConfigArgs = removeStreamFlagFromArgs(config.args);
+  const sanitizedExtraArgs = removeStreamFlagFromArgs(config.extraArgs);
+
+  const baseArgs = [...sanitizedConfigArgs];
+
+  let kokoroArgs: string[];
+
+  if (strategy === 'positional-output') {
+    kokoroArgs = [
+      ...baseArgs,
+      currentInputPath,
+      wavPath,
+      '--model',
+      config.modelPath,
+      '--voices',
+      config.voicesPath,
+      ...(config.lang ? ['--lang', config.lang] : []),
+      '--voice',
+      kokoroVoice,
+      ...(config.speed ? ['--speed', String(config.speed)] : []),
+      ...sanitizedExtraArgs,
+    ];
+  } else {
+    // Strategy A/B with `--save <wav>`.
+    kokoroArgs = [
+      ...baseArgs,
+      currentInputPath,
+      '--model',
+      config.modelPath,
+      '--voices',
+      config.voicesPath,
+      ...(config.lang ? ['--lang', config.lang] : []),
+      '--voice',
+      kokoroVoice,
+      ...(config.speed ? ['--speed', String(config.speed)] : []),
+      ...sanitizedExtraArgs,
+      ...(strategy === 'save-no-play' ? ['--no-play'] : []),
+      '--save',
+      wavPath,
+    ];
+  }
+
+  if (debugEnabled()) {
+    debugNotify(
+      ctx,
+      `Kokoro render-to-wav (chunk ${chunkIndex + 1}/${totalChunks}): command=${config.command} args=${JSON.stringify(kokoroArgs)}`,
+    );
+    if (debugEnabled()) {
+      // If the CLI supports it, it helps diagnose silent failures.
+      kokoroArgs.push('--debug');
+    }
+  }
+
+  renderStartTimes[chunkIndex] = performance.now();
+
+  let renderResult: Awaited<ReturnType<ExtensionAPI['exec']>>;
+  try {
+    renderResult = await pi.exec(config.command, kokoroArgs, {
+      signal: playbackController.signal,
+    });
+  } finally {
+    renderEndTimes[chunkIndex] = performance.now();
+  }
+
+  if (playbackController.signal.aborted || renderResult.killed) {
+    try {
+      if (existsSync(wavPath)) unlinkSync(wavPath);
+    } catch {
+      // best-effort cleanup
+    }
+
+    try {
+      if (existsSync(currentInputPath)) unlinkSync(currentInputPath);
+    } catch {
+      // best-effort cleanup
+    }
+
+    return {status: 'aborted'};
+  }
+
+  if (renderResult.code !== 0) {
+    const renderOutput =
+      `${renderResult.stderr}\n${renderResult.stdout}`.trim();
+    const errorMessage = formatSubprocessFailure(
+      renderOutput,
+      config.command,
+      'kokoro',
+    );
+    notify(ctx, errorMessage, 'error');
+
+    try {
+      if (existsSync(wavPath)) unlinkSync(wavPath);
+    } catch {
+      // best-effort cleanup
+    }
+
+    try {
+      if (existsSync(currentInputPath)) unlinkSync(currentInputPath);
+    } catch {
+      // best-effort cleanup
+    }
+
+    return {status: 'error'};
+  }
+
+  // Render succeeded. Caller will play and then delete `wavPath`.
+  try {
+    if (existsSync(currentInputPath)) unlinkSync(currentInputPath);
+  } catch {
+    // best-effort cleanup
+  }
+
+  return {status: 'ok', wavPath};
+}
+
+/* eslint-disable no-await-in-loop */
+async function speakKokoroChunks(parameters: {
+  pi: ExtensionAPI;
+  ctx: ExtensionContext;
+  config: Extract<TtsConfig, {backend: 'kokoro'}>;
+  chunks: string[];
+  playbackController: AbortController;
+}): Promise<boolean> {
+  const {pi, ctx, config, chunks, playbackController} = parameters;
+
+  const renderStartTimes: number[] = Array.from(
+    {length: chunks.length},
+    () => 0,
+  );
+  const renderEndTimes: number[] = Array.from({length: chunks.length}, () => 0);
+  const playStartTimes: number[] = Array.from({length: chunks.length}, () => 0);
+  const playEndTimes: number[] = Array.from({length: chunks.length}, () => 0);
+
+  const renderedWavs = new Set<string>();
+
+  const support = await detectKokoroRenderSupport(pi, config);
+
+  if (!support.supported) {
+    if (support.helpSnippet && debugEnabled()) {
+      debugNotify(
+        ctx,
+        `Kokoro render-to-wav capability detection failed. CLI help snippet: ${support.helpSnippet}`,
+        'warning',
+      );
+    }
+
+    notify(
+      ctx,
+      'Kokoro render-to-file is not supported by this kokoro-tts CLI. Falling back to sequential streaming (audible gaps may remain).',
+      'warning',
+    );
+
+    for (let i = 0; i < chunks.length; i++) {
+      if (playbackController.signal.aborted) return false;
+
+      const chunkText = chunks[i];
+      if (!chunkText) continue;
+
+      if (chunks.length > 1) {
+        notify(ctx, `Speaking chunk ${i + 1}/${chunks.length}...`, 'info');
+      }
+
+      const currentInputPath = join(tmpdir(), `pi-tts-${randomUUID()}.txt`);
+      writeFileSync(currentInputPath, chunkText, 'utf8');
+
+      const kokoroVoice = config.voice ?? 'af_sarah';
+
+      const kokoroArgs = [
+        ...config.args,
+        currentInputPath,
+        '--stream',
+        '--model',
+        config.modelPath,
+        '--voices',
+        config.voicesPath,
+        ...(config.lang ? ['--lang', config.lang] : []),
+        '--voice',
+        kokoroVoice,
+        ...(config.speed ? ['--speed', String(config.speed)] : []),
+        ...config.extraArgs,
+      ];
+
+      if (debugEnabled()) {
+        debugNotify(
+          ctx,
+          `Kokoro streaming (chunk ${i + 1}/${chunks.length}): command=${config.command} args=${JSON.stringify(kokoroArgs)}`,
+        );
+        kokoroArgs.push('--debug');
+      }
+
+      let renderResult: Awaited<ReturnType<ExtensionAPI['exec']>>;
+      try {
+        renderResult = await pi.exec(config.command, kokoroArgs, {
+          signal: playbackController.signal,
+        });
+      } finally {
+        // no-op
+      }
+
+      if (playbackController.signal.aborted || renderResult.killed) {
+        try {
+          if (existsSync(currentInputPath)) unlinkSync(currentInputPath);
+        } catch {
+          // best-effort cleanup
+        }
+
+        return false;
+      }
+
+      if (renderResult.code !== 0) {
+        const renderOutput =
+          `${renderResult.stderr}\n${renderResult.stdout}`.trim();
+        const errorMessage = formatSubprocessFailure(
+          renderOutput,
+          config.command,
+          'kokoro',
+        );
+        notify(ctx, errorMessage, 'error');
+
+        try {
+          if (existsSync(currentInputPath)) unlinkSync(currentInputPath);
+        } catch {
+          // best-effort cleanup
+        }
+
+        return false;
+      }
+
+      try {
+        if (existsSync(currentInputPath)) unlinkSync(currentInputPath);
+      } catch {
+        // best-effort cleanup
+      }
+    }
+
+    return true;
+  }
+
+  // Render-to-file pipeline (1-chunk lookahead)
+  try {
+    if (chunks.length === 0) return true;
+
+    let nextRenderPromise:
+      | Promise<
+          | {status: 'ok'; wavPath: string}
+          | {status: 'aborted'}
+          | {status: 'error'}
+        >
+      | undefined;
+
+    const startRender = async (index: number) => {
+      const wavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
+      return renderKokoroChunkToWav({
+        pi,
+        ctx,
+        config,
+        chunkText: chunks[index],
+        chunkIndex: index,
+        totalChunks: chunks.length,
+        playbackController,
+        wavPath,
+        renderStartTimes,
+        renderEndTimes,
+        strategy: support.strategy,
+      });
+    };
+
+    nextRenderPromise = startRender(0);
+
+    for (let i = 0; i < chunks.length; i++) {
+      if (playbackController.signal.aborted) return false;
+
+      const renderResult = await (nextRenderPromise as Promise<
+        | {status: 'ok'; wavPath: string}
+        | {status: 'aborted'}
+        | {status: 'error'}
+      >);
+
+      if (
+        playbackController.signal.aborted ||
+        renderResult.status === 'aborted'
+      ) {
+        return false;
+      }
+
+      if (renderResult.status === 'error') {
+        return false;
+      }
+
+      const currentWavPath = renderResult.wavPath;
+      renderedWavs.add(currentWavPath);
+
+      if (i + 1 < chunks.length && !playbackController.signal.aborted) {
+        debugNotify(
+          ctx,
+          `started rendering chunk ${i + 2}/${chunks.length} during playback of chunk ${i + 1}/${chunks.length}`,
+        );
+        nextRenderPromise = startRender(i + 1);
+      }
+
+      if (chunks.length > 1) {
+        notify(ctx, `Speaking chunk ${i + 1}/${chunks.length}...`, 'info');
+      }
+
+      if (debugEnabled()) {
+        debugNotify(ctx, `play start (chunk ${i + 1}/${chunks.length})`);
+      }
+
+      playStartTimes[i] = performance.now();
+
+      const ffplayResult = await pi.exec(
+        'ffplay',
+        ['-nodisp', '-autoexit', '-loglevel', 'quiet', currentWavPath],
+        {signal: playbackController.signal},
+      );
+
+      playEndTimes[i] = performance.now();
+
+      if (playbackController.signal.aborted || ffplayResult.killed) {
+        return false;
+      }
+
+      if (ffplayResult.code !== 0) {
+        const output = `${ffplayResult.stderr}\n${ffplayResult.stdout}`.trim();
+        const errorMessage = output
+          ? `ffplay failed with exit code ${ffplayResult.code}.\n\n--- stderr/stdout ---\n${output}`
+          : `ffplay failed with exit code ${ffplayResult.code}.`;
+        notify(ctx, errorMessage, 'error');
+        return false;
+      }
+
+      if (i + 1 < chunks.length && renderStartTimes[i + 1]) {
+        const gapMs = renderStartTimes[i + 1] - playEndTimes[i];
+        if (debugEnabled()) {
+          debugNotify(
+            ctx,
+            `gap between chunk ${i + 1} play end and chunk ${i + 2} render start: ${gapMs.toFixed(
+              1,
+            )}ms (negative means overlap)`,
+          );
+          debugNotify(
+            ctx,
+            `render duration chunk ${i + 1}: ${(renderEndTimes[i] - renderStartTimes[i]).toFixed(1)}ms; play duration: ${(playEndTimes[i] - playStartTimes[i]).toFixed(1)}ms`,
+          );
+        }
+      }
+
+      try {
+        if (existsSync(currentWavPath)) unlinkSync(currentWavPath);
+      } catch {
+        // best-effort cleanup
+      }
+
+      renderedWavs.delete(currentWavPath);
+
+      debugNotify(ctx, `play end (chunk ${i + 1}/${chunks.length})`);
+    }
+
+    return true;
+  } finally {
+    for (const wavPath of renderedWavs) {
+      try {
+        if (existsSync(wavPath)) unlinkSync(wavPath);
+      } catch {
+        // best-effort cleanup
+      }
+    }
+  }
+}
+
+/* eslint-enable no-await-in-loop */
+
 async function speakText(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -939,7 +1729,6 @@ async function speakText(
 
   let commandForError = 'tts';
   let backendForError: TtsBackend = 'piper';
-  let lastTempWavPath: string | undefined;
 
   try {
     if (playbackController.signal.aborted) return;
@@ -1034,189 +1823,35 @@ async function speakText(
       );
     }
 
-    for (let i = 0; i < chunks.length; i++) {
-      if (playbackController.signal.aborted) return;
-
-      const chunkText = chunks[i];
-      if (!chunkText) continue;
-
-      if (chunks.length > 1) {
-        notify(ctx, `Speaking chunk ${i + 1}/${chunks.length}...`, 'info');
-      }
-
-      if (config.backend === 'piper') {
-        lastTempWavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
-        const currentWavPath = lastTempWavPath;
-
-        const wavArgs = [
-          ...config.args,
-          ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
-          '-m',
-          config.model,
-          ...config.extraArgs,
-          '-f',
-          currentWavPath,
-          '--',
-          chunkText,
-        ];
-
-        // Helpful hint when debugging Piper configuration issues.
-        if (process.env.PIPER_PI_TTS_DEBUG === '1') {
-          notify(
+    const completed =
+      config.backend === 'piper'
+        ? await speakPiperChunks({
+            pi,
             ctx,
-            `Piper config: command=${config.command} chunk=${i + 1}/${chunks.length} args=${JSON.stringify(wavArgs)}`,
-            'info',
-          );
-        }
-
-        try {
-          commandForError = config.command;
-          // eslint-disable-next-line no-await-in-loop
-          const renderResult = await pi.exec(config.command, wavArgs, {
-            signal: playbackController.signal,
+            config,
+            chunks,
+            playbackController,
+          })
+        : await speakKokoroChunks({
+            pi,
+            ctx,
+            config,
+            chunks,
+            playbackController,
           });
 
-          if (playbackController.signal.aborted || renderResult.killed) {
-            return;
-          }
-
-          if (renderResult.code !== 0) {
-            const renderOutput = (
-              renderResult.stderr ||
-              renderResult.stdout ||
-              ''
-            ).toString();
-            const errorMessage = formatSubprocessFailure(
-              renderOutput,
-              config.command,
-              'piper',
-            );
-            notify(ctx, errorMessage, 'error');
-            return;
-          }
-
-          // Then play the rendered WAV in the foreground so stopPlayback can reliably cancel it.
-          commandForError = 'ffplay';
-          // eslint-disable-next-line no-await-in-loop
-          const ffplayResult = await pi.exec(
-            'ffplay',
-            ['-nodisp', '-autoexit', '-loglevel', 'quiet', currentWavPath],
-            {signal: playbackController.signal},
-          );
-
-          if (playbackController.signal.aborted || ffplayResult.killed) {
-            return;
-          }
-
-          if (ffplayResult.code !== 0) {
-            const output = (
-              ffplayResult.stderr ||
-              ffplayResult.stdout ||
-              ''
-            ).toString();
-            const errorMessage = output
-              ? `ffplay failed with exit code ${ffplayResult.code}.\n\n--- stderr/stdout ---\n${output}`
-              : `ffplay failed with exit code ${ffplayResult.code}.`;
-            notify(ctx, errorMessage, 'error');
-            return;
-          }
-        } finally {
-          if (existsSync(currentWavPath)) {
-            try {
-              unlinkSync(currentWavPath);
-            } catch {
-              // best-effort cleanup
-            }
-          }
-
-          if (lastTempWavPath === currentWavPath) {
-            lastTempWavPath = undefined;
-          }
-        }
-      } else {
-        const currentInputPath = join(tmpdir(), `pi-tts-${randomUUID()}.txt`);
-        writeFileSync(currentInputPath, chunkText, 'utf8');
-
-        const kokoroVoice = config.voice ?? 'af_sarah';
-
-        const kokoroArgs = [
-          ...config.args,
-          currentInputPath,
-          '--stream',
-          '--model',
-          config.modelPath,
-          '--voices',
-          config.voicesPath,
-          ...(config.lang ? ['--lang', config.lang] : []),
-          '--voice',
-          kokoroVoice,
-          ...(config.speed ? ['--speed', String(config.speed)] : []),
-          ...config.extraArgs,
-        ];
-
-        if (process.env.PIPER_PI_TTS_DEBUG === '1') {
-          notify(
-            ctx,
-            `Kokoro config: command=${config.command} chunk=${i + 1}/${chunks.length} args=${JSON.stringify(kokoroArgs)}`,
-            'info',
-          );
-        }
-
-        if (process.env.PIPER_PI_TTS_DEBUG === '1') {
-          kokoroArgs.push('--debug');
-        }
-
-        try {
-          commandForError = config.command;
-          // eslint-disable-next-line no-await-in-loop
-          const renderResult = await pi.exec(config.command, kokoroArgs, {
-            signal: playbackController.signal,
-          });
-
-          if (playbackController.signal.aborted || renderResult.killed) {
-            return;
-          }
-
-          if (renderResult.code !== 0) {
-            const renderOutput = (
-              renderResult.stderr ||
-              renderResult.stdout ||
-              ''
-            ).toString();
-            const errorMessage = formatSubprocessFailure(
-              renderOutput,
-              config.command,
-              'kokoro',
-            );
-            notify(ctx, errorMessage, 'error');
-            return;
-          }
-        } finally {
-          if (existsSync(currentInputPath)) {
-            try {
-              unlinkSync(currentInputPath);
-            } catch {
-              // best-effort cleanup
-            }
-          }
-        }
-      }
+    if (completed) {
+      notify(ctx, 'Spoken latest assistant message.', 'info');
     }
-
-    notify(ctx, 'Spoken latest assistant message.', 'info');
   } catch (error) {
     if (playbackController.signal.aborted || isAbortError(error)) return;
-    notify(ctx, formatExecError(commandForError, error, backendForError), 'error');
+    notify(
+      ctx,
+      formatExecError(commandForError, error, backendForError),
+      'error',
+    );
   } finally {
     cleanup();
-
-    if (lastTempWavPath && existsSync(lastTempWavPath)) {
-      try {
-        unlinkSync(lastTempWavPath);
-      } catch {
-        // best-effort cleanup
-      }
-    }
   }
 }
 
@@ -1316,6 +1951,7 @@ function formatSubprocessFailure(
     if (backend === 'kokoro' && /kokoro/i.test(output)) {
       return 'Kokoro is not installed. Install it with: pip install kokoro-tts';
     }
+
     if (backend === 'piper' && /piper/i.test(output)) {
       return 'Piper is not installed. Install it with: pip install piper-tts';
     }
