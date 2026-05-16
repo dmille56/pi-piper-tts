@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {normalizeSpeechText, removeStreamFlagFromArgs} from './tts.js';
+import {normalizeSpeechText, removeStreamFlagFromArgs} from '../extensions/tts.js';
 
 void test('normalizeSpeechText strips double-asterisks', () => {
   assert.equal(normalizeSpeechText('**bold**'), 'bold');
