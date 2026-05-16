@@ -608,24 +608,34 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
     }
 
     const envLang = envTrim('PI_TTS_LANG');
+    const legacyLang = envTrim('KOKORO_PI_LANG');
     const lang =
       envLang ??
       sectionTrim('lang') ??
-      envTrim('KOKORO_PI_LANG') ??
+      legacyLang ??
       sectionTrim('kokoro-tts-lang');
-    if (!envLang && lang === envTrim('KOKORO_PI_LANG')) {
+    if (
+      envLang === undefined &&
+      legacyLang !== undefined &&
+      lang === legacyLang
+    ) {
       pushWarning(
         'Deprecated TTS env var used: KOKORO_PI_LANG. Use PI_TTS_LANG instead.',
       );
     }
 
     const envVoice = envTrim('PI_TTS_VOICE');
+    const legacyVoice = envTrim('KOKORO_PI_VOICE');
     const voice =
       envVoice ??
       sectionTrim('voice') ??
-      envTrim('KOKORO_PI_VOICE') ??
+      legacyVoice ??
       sectionTrim('kokoro-tts-voice');
-    if (!envVoice && voice === envTrim('KOKORO_PI_VOICE')) {
+    if (
+      envVoice === undefined &&
+      legacyVoice !== undefined &&
+      voice === legacyVoice
+    ) {
       pushWarning(
         'Deprecated TTS env var used: KOKORO_PI_VOICE. Use PI_TTS_VOICE instead.',
       );
