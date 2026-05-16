@@ -1,7 +1,7 @@
 import {homedir, tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
-import {existsSync, readFileSync, unlinkSync} from 'node:fs';
+import {existsSync, readFileSync, unlinkSync, writeFileSync} from 'node:fs';
 import type {
   AgentEndEvent,
   ExtensionAPI,
@@ -32,11 +32,34 @@ type PiperConfig = {
   chunkChars?: number;
 };
 
+type KokoroConfig = {
+  command: string;
+  args: string[];
+  modelPath: string;
+  voicesPath: string;
+  lang?: string;
+  voice?: string;
+  speed?: number;
+  extraArgs: string[];
+  maxChars?: number;
+  chunkChars?: number;
+};
+
+type TtsBackend = 'piper' | 'kokoro';
+
+type TtsConfig =
+  | ({backend: 'piper'} & PiperConfig)
+  | ({backend: 'kokoro'} & KokoroConfig)
+  | {error: string};
+
 const defaultPiperCommand = 'python3';
 const defaultPiperCommandArgs = ['-m', 'piper'];
 
 // Module-scope so `/piper-tts-stop` can cancel the currently running playback.
 let activePlaybackController: AbortController | undefined;
+
+// One-time deprecation warnings for legacy config/env names.
+let didWarnDeprecatedConfig = false;
 
 function notify(
   ctx: ExtensionContext,
@@ -104,11 +127,35 @@ function parseCommandLine(value: string): string[] {
   return parts;
 }
 
-function expandPath(value: string): string {
+function expandPath(value: string, baseDir: string): string {
   const v = value.trim();
   if (v === '~') return homedir();
   if (v.startsWith('~/')) return join(homedir(), v.slice(2));
-  return value;
+
+  // If it looks like an absolute path (POSIX) or a Windows drive path, keep as-is.
+  if (v.startsWith('/') || /^[A-Za-z]:[\\/]/.test(v)) return v;
+
+  // Resolve other relative paths against the directory containing the settings.
+  if (v.startsWith('./') || v.startsWith('../') || v.startsWith('.')) {
+    return join(baseDir, v);
+  }
+  if (!v.includes('/') && !v.includes('\\')) {
+    // Bare filename: treat it as relative to baseDir (matches kokoro/piper CLIs).
+    return join(baseDir, v);
+  }
+
+  return join(baseDir, v);
+}
+
+function looksLikePath(value: string): boolean {
+  // If it resembles a filesystem path, we can validate with existsSync.
+  return (
+    value.includes('/') ||
+    value.includes('\\') ||
+    value.startsWith('.') ||
+    value.startsWith('/') ||
+    value.endsWith('.onnx')
+  );
 }
 
 function loadPiSettingsFile(path: string): unknown {
@@ -146,21 +193,37 @@ function getPiSettings(ctx: ExtensionContext): Record<string, unknown> {
   return {...globalSettings, ...projectSettings};
 }
 
-function getSettingsSection(
+type LoadedTtsSettings = {
+  section: Record<string, unknown>;
+  legacySection?: string;
+};
+
+function loadTtsSettingsSection(
   s: Record<string, unknown>,
-): Record<string, unknown> {
-  // Namespaced keys (pick one) in settings.json
-  // - { "pi-tts-command": { ... } }
-  // - { "tts": { ... } }
-  // - { "piper": { ... } }
-  const candidates = [s['pi-piper-tts'], s['pi-tts-command'], s.tts, s.piper];
-  for (const c of candidates) {
+): LoadedTtsSettings {
+  const canonical = s['pi-tts'];
+  if (isRecordUnknown(canonical)) {
+    return {section: canonical};
+  }
+
+  // Legacy section names (pre-unification).
+  const candidates: Array<[string, unknown]> = [
+    ['pi-piper-tts', s['pi-piper-tts']],
+    ['pi-tts-command', s['pi-tts-command']],
+    ['tts', s.tts],
+    ['piper', s.piper],
+  ];
+  for (const [name, c] of candidates) {
     if (isRecordUnknown(c)) {
-      return c;
+      return {section: c, legacySection: name};
     }
   }
 
-  return {};
+  return {section: {}};
+}
+
+function getSettingsSection(s: Record<string, unknown>): Record<string, unknown> {
+  return loadTtsSettingsSection(s).section;
 }
 
 function parseOptionalBoolean(value: unknown): boolean | undefined {
@@ -191,17 +254,21 @@ function parseOptionalBoolean(value: unknown): boolean | undefined {
 function isTtsAliasEnabledFromSettings(
   section: Record<string, unknown>,
 ): boolean {
-  // Keep it simple: section key `enable-tts-alias`.
-  const raw = section['enable-tts-alias'] ?? section.enableTtsAlias;
+  const raw =
+    section['enable-alias'] ?? section.enableAlias ??
+    section['enable-tts-alias'] ??
+    section.enableTtsAlias;
   const parsed = parseOptionalBoolean(raw);
   return parsed ?? true;
 }
 
 function isTtsAliasEnabledAtLoad(): boolean {
   // Default ON for backward compatibility.
-  const envRaw = process.env.PIPER_PI_ENABLE_TTS_ALIAS?.trim();
-  if (envRaw) {
-    const parsed = parseOptionalBoolean(envRaw);
+  const envRaw = process.env.PI_TTS_ENABLE_ALIAS?.trim();
+  const legacyEnvRaw = process.env.PIPER_PI_ENABLE_TTS_ALIAS?.trim();
+  const raw = envRaw ?? legacyEnvRaw;
+  if (raw) {
+    const parsed = parseOptionalBoolean(raw);
     if (parsed !== undefined) return parsed;
     return true;
   }
@@ -211,7 +278,7 @@ function isTtsAliasEnabledAtLoad(): boolean {
   const globalSettings = asRecordUnknown(loadPiSettingsFile(globalPath));
   const projectSettings = asRecordUnknown(loadPiSettingsFile(projectPath));
   const settings = {...globalSettings, ...projectSettings};
-  const section = getSettingsSection(settings);
+  const section = loadTtsSettingsSection(settings).section;
   return isTtsAliasEnabledFromSettings(section);
 }
 
@@ -225,9 +292,11 @@ function isAutoPlayEnabledFromSettings(
 }
 
 function isAutoPlayEnabledAtLoad(): boolean {
-  const envRaw = process.env.PIPER_PI_AUTO_PLAY?.trim();
-  if (envRaw) {
-    const parsed = parseOptionalBoolean(envRaw);
+  const envRaw = process.env.PI_TTS_AUTO_PLAY?.trim();
+  const legacyEnvRaw = process.env.PIPER_PI_AUTO_PLAY?.trim();
+  const raw = envRaw ?? legacyEnvRaw;
+  if (raw) {
+    const parsed = parseOptionalBoolean(raw);
     return parsed ?? false;
   }
 
@@ -236,73 +305,128 @@ function isAutoPlayEnabledAtLoad(): boolean {
   const globalSettings = asRecordUnknown(loadPiSettingsFile(globalPath));
   const projectSettings = asRecordUnknown(loadPiSettingsFile(projectPath));
   const settings = {...globalSettings, ...projectSettings};
-  const section = getSettingsSection(settings);
+  const section = loadTtsSettingsSection(settings).section;
   return isAutoPlayEnabledFromSettings(section);
 }
 
-function getConfig(ctx: ExtensionContext): PiperConfig | {error: string} {
+function getConfig(ctx: ExtensionContext): TtsConfig {
   const settings = getPiSettings(ctx);
-  const section = getSettingsSection(settings);
+  const {section, legacySection} = loadTtsSettingsSection(settings);
 
-  const modelFromSection = section['piper-pi-model'];
-  const modelRaw =
-    process.env.PIPER_PI_MODEL?.trim() ??
-    (typeof modelFromSection === 'string' ? modelFromSection.trim() : '');
-  const model = modelRaw ? expandPath(modelRaw) : '';
-  if (!model) {
-    return {
-      error:
-        "Missing Piper model. Set PIPER_PI_MODEL (env) or settings.json 'pi-tts-command.piper-pi-model'.",
-    };
+  // Resolve relative paths against the directory that contains the project's
+  // `.pi/settings.json` (or `process.cwd()` if no `ctx.cwd` was provided).
+  let baseDir = process.cwd();
+  if (typeof ctx === 'object' && ctx !== null && 'cwd' in ctx) {
+    const raw = (ctx as {cwd?: unknown}).cwd;
+    if (typeof raw === 'string' && raw) baseDir = raw;
   }
 
-  const binFromEnv = process.env.PIPER_PI_BIN?.trim();
-  const binFromSettingsRaw = section['piper-pi-bin'];
-  const binFromSettings =
-    typeof binFromSettingsRaw === 'string' ? binFromSettingsRaw.trim() : '';
+  const warnings: string[] = [];
+  const pushWarning = (message: string) => {
+    if (!warnings.includes(message)) warnings.push(message);
+  };
 
-  const binSpec =
-    binFromEnv && binFromEnv.length > 0
-      ? binFromEnv
-      : binFromSettings && binFromSettings.length > 0
-        ? binFromSettings
-        : defaultPiperCommand;
+  const envTrim = (name: string): string | undefined => {
+    const raw = process.env[name];
+    if (typeof raw !== 'string') return undefined;
+    const trimmed = raw.trim();
+    return trimmed ? trimmed : undefined;
+  };
 
-  const binParts = parseCommandLine(binSpec);
-  if (binParts.length === 0) {
-    return {error: 'PIPER_PI_BIN / settings.json piper-pi-bin is empty.'};
+  const sectionTrim = (key: string): string | undefined => {
+    const raw = section[key];
+    if (typeof raw !== 'string') return undefined;
+    const trimmed = raw.trim();
+    return trimmed ? trimmed : undefined;
+  };
+
+  // Deprecation warnings (one-time per extension load).
+  if (legacySection) {
+    pushWarning(
+      `Deprecated TTS settings section used: ${legacySection}. Use settings.json section 'pi-tts' instead.`,
+    );
   }
 
-  const command = binParts[0];
-  const runnerArgs = binParts.length > 1 ? binParts.slice(1) : [];
+  const maybeWarnOnce = () => {
+    if (didWarnDeprecatedConfig) return;
+    if (warnings.length === 0) return;
 
-  let extraArgs: string[] = [];
-  const envExtraArgs = process.env.PIPER_PI_EXTRA_ARGS?.trim();
-  if (envExtraArgs) {
-    extraArgs = parseCommandLine(envExtraArgs);
-  } else {
-    const fromSettings = section['piper-pi-extra-args'];
-    const settingsExtraArgs =
-      typeof fromSettings === 'string' ? fromSettings.trim() : '';
-    extraArgs = settingsExtraArgs ? parseCommandLine(settingsExtraArgs) : [];
+    didWarnDeprecatedConfig = true;
+    for (const w of warnings) {
+      notify(ctx, w, 'warning');
+      if (!ctx.hasUI) console.warn(w);
+    }
+  };
+
+  const legacyAliasEnv = envTrim('PIPER_PI_ENABLE_TTS_ALIAS');
+  const canonicalAliasEnv = envTrim('PI_TTS_ENABLE_ALIAS');
+  if (!canonicalAliasEnv && legacyAliasEnv) {
+    pushWarning(
+      'Deprecated TTS env var used: PIPER_PI_ENABLE_TTS_ALIAS. Use PI_TTS_ENABLE_ALIAS instead.',
+    );
   }
 
-  const dataDirFromEnv = process.env.PIPER_PI_DATA_DIR?.trim();
-  const dataDirFromSettingsRaw = section['piper-pi-data-dir'];
-  const dataDirRaw =
-    dataDirFromEnv ??
-    (typeof dataDirFromSettingsRaw === 'string'
-      ? dataDirFromSettingsRaw.trim()
-      : '');
-  const dataDir = dataDirRaw ? expandPath(dataDirRaw) : undefined;
+  const legacyAutoPlayEnv = envTrim('PIPER_PI_AUTO_PLAY');
+  const canonicalAutoPlayEnv = envTrim('PI_TTS_AUTO_PLAY');
+  if (!canonicalAutoPlayEnv && legacyAutoPlayEnv) {
+    pushWarning(
+      'Deprecated TTS env var used: PIPER_PI_AUTO_PLAY. Use PI_TTS_AUTO_PLAY instead.',
+    );
+  }
 
-  const maxCharsFromEnv = process.env.PIPER_PI_MAX_CHARS?.trim();
-  const maxCharsFromSettingsRaw = section['piper-pi-max-chars'];
+  // Backend selection
+  const backendEnvCanonical = envTrim('PI_TTS_BACKEND');
+  const backendEnvLegacy = envTrim('PIPER_PI_TTS_BACKEND');
+  const backendFromCanonicalSettings = sectionTrim('backend');
+  const backendFromLegacySettings =
+    sectionTrim('tts-backend') ?? sectionTrim('ttsBackend');
+
+  let backend: TtsBackend = 'piper';
+  if (backendEnvCanonical) {
+    backend = backendEnvCanonical.toLowerCase() === 'kokoro' ? 'kokoro' : 'piper';
+  } else if (backendFromCanonicalSettings) {
+    backend =
+      backendFromCanonicalSettings.toLowerCase() === 'kokoro' ? 'kokoro' : 'piper';
+  } else if (backendFromLegacySettings) {
+    pushWarning(
+      'Deprecated TTS settings key used for backend: tts-backend. Use settings.json key "backend" under "pi-tts" instead.',
+    );
+    backend = backendFromLegacySettings.toLowerCase() === 'kokoro' ? 'kokoro' : 'piper';
+  } else if (backendEnvLegacy) {
+    pushWarning(
+      'Deprecated TTS env var used for backend: PIPER_PI_TTS_BACKEND. Use PI_TTS_BACKEND instead.',
+    );
+    backend = backendEnvLegacy.toLowerCase() === 'kokoro' ? 'kokoro' : 'piper';
+  }
+
+  // maxChars
+  const defaultChunkChars = 200;
+  const maxCharsEnvCanonical = envTrim('PI_TTS_MAX_CHARS');
+  const maxCharsEnvLegacy = envTrim('PIPER_PI_MAX_CHARS');
+  const maxCharsFromCanonicalSettings = sectionTrim('max-chars');
+  const maxCharsFromLegacySettings = sectionTrim('piper-pi-max-chars');
+
   const maxCharsRaw =
-    maxCharsFromEnv ??
-    (typeof maxCharsFromSettingsRaw === 'string'
-      ? maxCharsFromSettingsRaw.trim()
-      : '');
+    maxCharsEnvCanonical ??
+    maxCharsFromCanonicalSettings ??
+    (maxCharsEnvLegacy
+      ? (() => {
+          pushWarning(
+            'Deprecated TTS env var used: PIPER_PI_MAX_CHARS. Use PI_TTS_MAX_CHARS instead.',
+          );
+          return maxCharsEnvLegacy;
+        })()
+      : undefined) ??
+    (maxCharsFromLegacySettings
+      ? (() => {
+          pushWarning(
+            'Deprecated TTS settings key used: piper-pi-max-chars. Use settings.json key "max-chars" under "pi-tts" instead.',
+          );
+          return maxCharsFromLegacySettings;
+        })()
+      : undefined) ??
+    undefined;
+
   const maxCharsParsed = maxCharsRaw
     ? Number.parseInt(maxCharsRaw, 10)
     : undefined;
@@ -314,18 +438,36 @@ function getConfig(ctx: ExtensionContext): PiperConfig | {error: string} {
       : undefined;
 
   if (maxCharsRaw && maxChars === undefined) {
-    return {error: 'PIPER_PI_MAX_CHARS must be a positive integer.'};
+    maybeWarnOnce();
+    return {error: 'PI_TTS_MAX_CHARS must be a positive integer.'};
   }
 
-  const defaultChunkChars = 200;
+  // chunkChars
+  const chunkCharsEnvCanonical = envTrim('PI_TTS_CHUNK_CHARS');
+  const chunkCharsEnvLegacy = envTrim('PIPER_PI_CHUNK_CHARS');
+  const chunkCharsFromCanonicalSettings = sectionTrim('chunk-chars');
+  const chunkCharsFromLegacySettings = sectionTrim('piper-pi-chunk-chars');
 
-  const chunkCharsFromEnv = process.env.PIPER_PI_CHUNK_CHARS?.trim();
-  const chunkCharsFromSettingsRaw = section['piper-pi-chunk-chars'];
   const chunkCharsRaw =
-    chunkCharsFromEnv ??
-    (typeof chunkCharsFromSettingsRaw === 'string'
-      ? chunkCharsFromSettingsRaw.trim()
-      : '');
+    chunkCharsEnvCanonical ??
+    chunkCharsFromCanonicalSettings ??
+    (chunkCharsEnvLegacy
+      ? (() => {
+          pushWarning(
+            'Deprecated TTS env var used: PIPER_PI_CHUNK_CHARS. Use PI_TTS_CHUNK_CHARS instead.',
+          );
+          return chunkCharsEnvLegacy;
+        })()
+      : undefined) ??
+    (chunkCharsFromLegacySettings
+      ? (() => {
+          pushWarning(
+            'Deprecated TTS settings key used: piper-pi-chunk-chars. Use settings.json key "chunk-chars" under "pi-tts" instead.',
+          );
+          return chunkCharsFromLegacySettings;
+        })()
+      : undefined) ??
+    '';
 
   const chunkCharsParsed = chunkCharsRaw
     ? Number.parseInt(chunkCharsRaw, 10)
@@ -344,14 +486,303 @@ function getConfig(ctx: ExtensionContext): PiperConfig | {error: string} {
         ? undefined
         : defaultChunkChars;
 
-  // Back-compat: if runner was only the python command, use the old default args.
-  if (command === defaultPiperCommand && runnerArgs.length === 0) {
-    runnerArgs.push(...defaultPiperCommandArgs);
+  // Renderer bin/args
+  const parseBin = (binSpec: string): {command: string; args: string[]} | {error: string} => {
+    const binParts = parseCommandLine(binSpec);
+    if (binParts.length === 0) return {error: 'TTS bin spec is empty.'};
+    const command = binParts[0];
+    const runnerArgs = binParts.length > 1 ? binParts.slice(1) : [];
+    return {command, args: runnerArgs};
+  };
+
+  if (backend === 'kokoro') {
+    const binSpec =
+      envTrim('PI_TTS_BIN') ??
+      sectionTrim('bin') ??
+      envTrim('KOKORO_PI_BIN') ??
+      sectionTrim('kokoro-tts-bin') ??
+      'kokoro-tts';
+
+    if (binSpec === envTrim('KOKORO_PI_BIN') && envTrim('PI_TTS_BIN') === undefined) {
+      pushWarning(
+        'Deprecated TTS env var used: KOKORO_PI_BIN. Use PI_TTS_BIN instead.',
+      );
+    }
+    if (
+      binSpec === sectionTrim('kokoro-tts-bin') &&
+      envTrim('PI_TTS_BIN') === undefined &&
+      sectionTrim('bin') === undefined
+    ) {
+      pushWarning(
+        'Deprecated TTS settings key used: kokoro-tts-bin. Use settings.json key "bin" under "pi-tts" instead.',
+      );
+    }
+
+    const binResolved = parseBin(binSpec);
+    if ('error' in binResolved) {
+      maybeWarnOnce();
+      return {error: binResolved.error};
+    }
+
+    const modelRaw =
+      envTrim('PI_TTS_MODEL') ??
+      sectionTrim('model') ??
+      envTrim('KOKORO_PI_MODEL') ??
+      sectionTrim('kokoro-tts-model') ??
+      '';
+    if (
+      modelRaw === envTrim('KOKORO_PI_MODEL') &&
+      envTrim('PI_TTS_MODEL') === undefined &&
+      sectionTrim('model') === undefined
+    ) {
+      pushWarning(
+        'Deprecated TTS env var used: KOKORO_PI_MODEL. Use PI_TTS_MODEL instead.',
+      );
+    }
+    if (
+      modelRaw === sectionTrim('kokoro-tts-model') &&
+      envTrim('PI_TTS_MODEL') === undefined &&
+      sectionTrim('model') === undefined
+    ) {
+      pushWarning(
+        'Deprecated TTS settings key used: kokoro-tts-model. Use settings.json key "model" under "pi-tts" instead.',
+      );
+    }
+
+    const voicesRaw =
+      envTrim('PI_TTS_VOICES') ??
+      sectionTrim('voices') ??
+      envTrim('KOKORO_PI_VOICES') ??
+      sectionTrim('kokoro-tts-voices') ??
+      '';
+    if (
+      voicesRaw === envTrim('KOKORO_PI_VOICES') &&
+      envTrim('PI_TTS_VOICES') === undefined &&
+      sectionTrim('voices') === undefined
+    ) {
+      pushWarning(
+        'Deprecated TTS env var used: KOKORO_PI_VOICES. Use PI_TTS_VOICES instead.',
+      );
+    }
+    if (
+      voicesRaw === sectionTrim('kokoro-tts-voices') &&
+      envTrim('PI_TTS_VOICES') === undefined &&
+      sectionTrim('voices') === undefined
+    ) {
+      pushWarning(
+        'Deprecated TTS settings key used: kokoro-tts-voices. Use settings.json key "voices" under "pi-tts" instead.',
+      );
+    }
+
+    const modelPath = modelRaw ? expandPath(modelRaw, baseDir) : '';
+    const voicesPath = voicesRaw ? expandPath(voicesRaw, baseDir) : '';
+    if (!modelPath) {
+      maybeWarnOnce();
+      return {
+        error:
+          'Missing Kokoro model. Set PI_TTS_MODEL (env) or settings.json "model" under "pi-tts".',
+      };
+    }
+    if (!voicesPath) {
+      maybeWarnOnce();
+      return {
+        error:
+          'Missing Kokoro voices file. Set PI_TTS_VOICES (env) or settings.json "voices" under "pi-tts".',
+      };
+    }
+
+    const envLang = envTrim('PI_TTS_LANG');
+    const lang =
+      envLang ??
+      sectionTrim('lang') ??
+      envTrim('KOKORO_PI_LANG') ??
+      sectionTrim('kokoro-tts-lang');
+    if (!envLang && lang === envTrim('KOKORO_PI_LANG')) {
+      pushWarning(
+        'Deprecated TTS env var used: KOKORO_PI_LANG. Use PI_TTS_LANG instead.',
+      );
+    }
+
+    const envVoice = envTrim('PI_TTS_VOICE');
+    const voice =
+      envVoice ??
+      sectionTrim('voice') ??
+      envTrim('KOKORO_PI_VOICE') ??
+      sectionTrim('kokoro-tts-voice');
+    if (!envVoice && voice === envTrim('KOKORO_PI_VOICE')) {
+      pushWarning(
+        'Deprecated TTS env var used: KOKORO_PI_VOICE. Use PI_TTS_VOICE instead.',
+      );
+    }
+
+    const speedRaw =
+      envTrim('PI_TTS_SPEED') ??
+      sectionTrim('speed') ??
+      envTrim('KOKORO_PI_SPEED') ??
+      sectionTrim('kokoro-tts-speed') ??
+      '';
+    const speedParsed = speedRaw ? Number.parseFloat(speedRaw) : undefined;
+    const speed =
+      speedParsed !== undefined &&
+      Number.isFinite(speedParsed) &&
+      speedParsed > 0
+        ? speedParsed
+        : speedRaw
+          ? undefined
+          : undefined;
+    if (speedRaw && speed === undefined) {
+      maybeWarnOnce();
+      return {error: 'PI_TTS_SPEED must be a positive number.'};
+    }
+
+    const extraArgs: string[] = [];
+    const extraEnv = envTrim('PI_TTS_EXTRA_ARGS');
+    const extraFromSection = sectionTrim('extra-args');
+    const extraLegacyEnv = envTrim('KOKORO_PI_EXTRA_ARGS');
+    const extraLegacySection = sectionTrim('kokoro-tts-extra-args');
+    const extraSpec =
+      extraEnv ??
+      extraFromSection ??
+      extraLegacyEnv ??
+      extraLegacySection ??
+      '';
+    if (extraSpec) {
+      if (!extraEnv && !extraFromSection && extraLegacyEnv) {
+        pushWarning(
+          'Deprecated TTS env var used: KOKORO_PI_EXTRA_ARGS. Use PI_TTS_EXTRA_ARGS instead.',
+        );
+      }
+      if (!extraEnv && !extraFromSection && !extraLegacyEnv && extraLegacySection) {
+        pushWarning(
+          'Deprecated TTS settings key used: kokoro-tts-extra-args. Use settings.json key "extra-args" under "pi-tts" instead.',
+        );
+      }
+      extraArgs.push(...parseCommandLine(extraSpec));
+    }
+
+    maybeWarnOnce();
+
+    return {
+      backend: 'kokoro',
+      command: binResolved.command,
+      args: binResolved.args,
+      modelPath,
+      voicesPath,
+      lang: lang || undefined,
+      voice: voice || undefined,
+      speed,
+      extraArgs,
+      maxChars,
+      chunkChars,
+    };
   }
 
+  // Piper backend
+  const binSpec =
+    envTrim('PI_TTS_BIN') ??
+    sectionTrim('bin') ??
+    envTrim('PIPER_PI_BIN') ??
+    sectionTrim('piper-pi-bin') ??
+    defaultPiperCommand;
+
+  if (binSpec === envTrim('PIPER_PI_BIN') && envTrim('PI_TTS_BIN') === undefined) {
+    pushWarning('Deprecated TTS env var used: PIPER_PI_BIN. Use PI_TTS_BIN instead.');
+  }
+  if (
+    binSpec === sectionTrim('piper-pi-bin') &&
+    envTrim('PI_TTS_BIN') === undefined &&
+    sectionTrim('bin') === undefined
+  ) {
+    pushWarning(
+      'Deprecated TTS settings key used: piper-pi-bin. Use settings.json key "bin" under "pi-tts" instead.',
+    );
+  }
+
+  const binResolved = parseBin(binSpec);
+  if ('error' in binResolved) {
+    maybeWarnOnce();
+    return {error: binResolved.error};
+  }
+
+  const modelRaw =
+    envTrim('PI_TTS_MODEL') ??
+    sectionTrim('model') ??
+    envTrim('PIPER_PI_MODEL') ??
+    sectionTrim('piper-pi-model') ??
+    '';
+  if (modelRaw === envTrim('PIPER_PI_MODEL') && envTrim('PI_TTS_MODEL') === undefined && sectionTrim('model') === undefined) {
+    pushWarning(
+      'Deprecated TTS env var used: PIPER_PI_MODEL. Use PI_TTS_MODEL instead.',
+    );
+  }
+
+  const model = modelRaw ? expandPath(modelRaw, baseDir) : '';
+  if (!model) {
+    maybeWarnOnce();
+    return {
+      error: 'Missing Piper model. Set PI_TTS_MODEL (env) or settings.json "model" under "pi-tts".',
+    };
+  }
+
+  const dataDirRaw =
+    envTrim('PI_TTS_DATA_DIR') ??
+    sectionTrim('data-dir') ??
+    envTrim('PIPER_PI_DATA_DIR') ??
+    sectionTrim('piper-pi-data-dir') ??
+    '';
+  if (
+    dataDirRaw === envTrim('PIPER_PI_DATA_DIR') &&
+    envTrim('PI_TTS_DATA_DIR') === undefined &&
+    sectionTrim('data-dir') === undefined
+  ) {
+    pushWarning(
+      'Deprecated TTS env var used: PIPER_PI_DATA_DIR. Use PI_TTS_DATA_DIR instead.',
+    );
+  }
+
+  const dataDir = dataDirRaw ? expandPath(dataDirRaw, baseDir) : undefined;
+
+  const extraEnv = envTrim('PI_TTS_EXTRA_ARGS');
+  const extraFromSection = sectionTrim('extra-args');
+  const extraLegacyEnv = envTrim('PIPER_PI_EXTRA_ARGS');
+  const extraLegacySection = sectionTrim('piper-pi-extra-args');
+  const extraSpec =
+    extraEnv ??
+    extraFromSection ??
+    extraLegacyEnv ??
+    extraLegacySection ??
+    '';
+
+  if (extraSpec && !extraEnv && !extraFromSection && extraLegacyEnv) {
+    pushWarning(
+      'Deprecated TTS env var used: PIPER_PI_EXTRA_ARGS. Use PI_TTS_EXTRA_ARGS instead.',
+    );
+  }
+  if (
+    extraSpec &&
+    !extraEnv &&
+    !extraFromSection &&
+    !extraLegacyEnv &&
+    extraLegacySection
+  ) {
+    pushWarning(
+      'Deprecated TTS settings key used: piper-pi-extra-args. Use settings.json key "extra-args" under "pi-tts" instead.',
+    );
+  }
+
+  const extraArgs = extraSpec ? parseCommandLine(extraSpec) : [];
+
+  // Back-compat: if runner was only the python command, use the old default args.
+  if (binResolved.command === defaultPiperCommand && binResolved.args.length === 0) {
+    binResolved.args.push(...defaultPiperCommandArgs);
+  }
+
+  maybeWarnOnce();
+
   return {
-    command,
-    args: runnerArgs,
+    backend: 'piper',
+    command: binResolved.command,
+    args: binResolved.args,
     model,
     dataDir,
     extraArgs,
@@ -506,8 +937,9 @@ async function speakText(
     }
   }
 
-  let commandForError = 'piper';
-  let wavPath: string | undefined;
+  let commandForError = 'tts';
+  let backendForError: TtsBackend = 'piper';
+  let lastTempWavPath: string | undefined;
 
   try {
     if (playbackController.signal.aborted) return;
@@ -517,6 +949,9 @@ async function speakText(
       notify(ctx, config.error, 'error');
       return;
     }
+
+    commandForError = config.backend === 'piper' ? 'piper' : 'kokoro-tts';
+    backendForError = config.backend;
 
     if (process.env.PIPER_PI_TTS_DEBUG === '1') {
       debugDumpConfig(ctx, config);
@@ -540,21 +975,47 @@ async function speakText(
       }
     }
 
-    // Validate model path early so we can show a precise error.
-    if (!existsSync(config.model)) {
-      notify(ctx, `Piper model file not found at: ${config.model}`, 'error');
-      return;
-    }
+    if (config.backend === 'piper') {
+      if (looksLikePath(config.model)) {
+        // Validate model path early so we can show a precise error.
+        if (!existsSync(config.model)) {
+          notify(
+            ctx,
+            `Piper model file not found at: ${config.model}`,
+            'error',
+          );
+          return;
+        }
 
-    // Piper usually expects a sibling JSON config next to the ONNX.
-    const modelJsonPath = `${config.model}.json`;
-    if (!existsSync(modelJsonPath)) {
-      notify(
-        ctx,
-        `Piper voice config JSON not found at: ${modelJsonPath} (piper guesses this automatically).`,
-        'error',
-      );
-      return;
+        // Piper usually expects a sibling JSON config next to the ONNX.
+        const modelJsonPath = `${config.model}.json`;
+        if (!existsSync(modelJsonPath)) {
+          notify(
+            ctx,
+            `Piper voice config JSON not found at: ${modelJsonPath} (piper guesses this automatically).`,
+            'error',
+          );
+          return;
+        }
+      }
+    } else {
+      if (!existsSync(config.modelPath)) {
+        notify(
+          ctx,
+          `Kokoro model file not found at: ${config.modelPath}`,
+          'error',
+        );
+        return;
+      }
+
+      if (!existsSync(config.voicesPath)) {
+        notify(
+          ctx,
+          `Kokoro voices file not found at: ${config.voicesPath}`,
+          'error',
+        );
+        return;
+      }
     }
 
     const {chunkChars} = config;
@@ -583,91 +1044,161 @@ async function speakText(
         notify(ctx, `Speaking chunk ${i + 1}/${chunks.length}...`, 'info');
       }
 
-      wavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
-      const currentWavPath = wavPath;
+      if (config.backend === 'piper') {
+        lastTempWavPath = join(tmpdir(), `pi-tts-${randomUUID()}.wav`);
+        const currentWavPath = lastTempWavPath;
 
-      const wavArgs = [
-        ...config.args,
-        ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
-        '-m',
-        config.model,
-        ...config.extraArgs,
-        '-f',
-        currentWavPath,
-        '--',
-        chunkText,
-      ];
+        const wavArgs = [
+          ...config.args,
+          ...(config.dataDir ? ['--data-dir', config.dataDir] : []),
+          '-m',
+          config.model,
+          ...config.extraArgs,
+          '-f',
+          currentWavPath,
+          '--',
+          chunkText,
+        ];
 
-      // Helpful hint when debugging Piper configuration issues.
-      if (process.env.PIPER_PI_TTS_DEBUG === '1') {
-        notify(
-          ctx,
-          `Piper config: command=${config.command} chunk=${i + 1}/${chunks.length} args=${JSON.stringify(wavArgs)}`,
-          'info',
-        );
-      }
-
-      try {
-        commandForError = config.command;
-        // eslint-disable-next-line no-await-in-loop
-        const renderResult = await pi.exec(config.command, wavArgs, {
-          signal: playbackController.signal,
-        });
-
-        if (playbackController.signal.aborted || renderResult.killed) {
-          return;
-        }
-
-        if (renderResult.code !== 0) {
-          const renderOutput = (
-            renderResult.stderr ||
-            renderResult.stdout ||
-            ''
-          ).toString();
-          const errorMessage = formatSubprocessFailure(
-            renderOutput,
-            config.command,
+        // Helpful hint when debugging Piper configuration issues.
+        if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+          notify(
+            ctx,
+            `Piper config: command=${config.command} chunk=${i + 1}/${chunks.length} args=${JSON.stringify(wavArgs)}`,
+            'info',
           );
-          notify(ctx, errorMessage, 'error');
-          return;
         }
 
-        // Then play the rendered WAV in the foreground so stopPlayback can reliably cancel it.
-        commandForError = 'ffplay';
-        // eslint-disable-next-line no-await-in-loop
-        const ffplayResult = await pi.exec(
-          'ffplay',
-          ['-nodisp', '-autoexit', '-loglevel', 'quiet', currentWavPath],
-          {signal: playbackController.signal},
-        );
+        try {
+          commandForError = config.command;
+          // eslint-disable-next-line no-await-in-loop
+          const renderResult = await pi.exec(config.command, wavArgs, {
+            signal: playbackController.signal,
+          });
 
-        if (playbackController.signal.aborted || ffplayResult.killed) {
-          return;
-        }
+          if (playbackController.signal.aborted || renderResult.killed) {
+            return;
+          }
 
-        if (ffplayResult.code !== 0) {
-          const output = (
-            ffplayResult.stderr ||
-            ffplayResult.stdout ||
-            ''
-          ).toString();
-          const errorMessage = output
-            ? `ffplay failed with exit code ${ffplayResult.code}.\n\n--- stderr/stdout ---\n${output}`
-            : `ffplay failed with exit code ${ffplayResult.code}.`;
-          notify(ctx, errorMessage, 'error');
-          return;
-        }
-      } finally {
-        if (existsSync(currentWavPath)) {
-          try {
-            unlinkSync(currentWavPath);
-          } catch {
-            // best-effort cleanup
+          if (renderResult.code !== 0) {
+            const renderOutput = (
+              renderResult.stderr ||
+              renderResult.stdout ||
+              ''
+            ).toString();
+            const errorMessage = formatSubprocessFailure(
+              renderOutput,
+              config.command,
+              'piper',
+            );
+            notify(ctx, errorMessage, 'error');
+            return;
+          }
+
+          // Then play the rendered WAV in the foreground so stopPlayback can reliably cancel it.
+          commandForError = 'ffplay';
+          // eslint-disable-next-line no-await-in-loop
+          const ffplayResult = await pi.exec(
+            'ffplay',
+            ['-nodisp', '-autoexit', '-loglevel', 'quiet', currentWavPath],
+            {signal: playbackController.signal},
+          );
+
+          if (playbackController.signal.aborted || ffplayResult.killed) {
+            return;
+          }
+
+          if (ffplayResult.code !== 0) {
+            const output = (
+              ffplayResult.stderr ||
+              ffplayResult.stdout ||
+              ''
+            ).toString();
+            const errorMessage = output
+              ? `ffplay failed with exit code ${ffplayResult.code}.\n\n--- stderr/stdout ---\n${output}`
+              : `ffplay failed with exit code ${ffplayResult.code}.`;
+            notify(ctx, errorMessage, 'error');
+            return;
+          }
+        } finally {
+          if (existsSync(currentWavPath)) {
+            try {
+              unlinkSync(currentWavPath);
+            } catch {
+              // best-effort cleanup
+            }
+          }
+
+          if (lastTempWavPath === currentWavPath) {
+            lastTempWavPath = undefined;
           }
         }
+      } else {
+        const currentInputPath = join(tmpdir(), `pi-tts-${randomUUID()}.txt`);
+        writeFileSync(currentInputPath, chunkText, 'utf8');
 
-        if (wavPath === currentWavPath) {
-          wavPath = undefined;
+        const kokoroVoice = config.voice ?? 'af_sarah';
+
+        const kokoroArgs = [
+          ...config.args,
+          currentInputPath,
+          '--stream',
+          '--model',
+          config.modelPath,
+          '--voices',
+          config.voicesPath,
+          ...(config.lang ? ['--lang', config.lang] : []),
+          '--voice',
+          kokoroVoice,
+          ...(config.speed ? ['--speed', String(config.speed)] : []),
+          ...config.extraArgs,
+        ];
+
+        if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+          notify(
+            ctx,
+            `Kokoro config: command=${config.command} chunk=${i + 1}/${chunks.length} args=${JSON.stringify(kokoroArgs)}`,
+            'info',
+          );
+        }
+
+        if (process.env.PIPER_PI_TTS_DEBUG === '1') {
+          kokoroArgs.push('--debug');
+        }
+
+        try {
+          commandForError = config.command;
+          // eslint-disable-next-line no-await-in-loop
+          const renderResult = await pi.exec(config.command, kokoroArgs, {
+            signal: playbackController.signal,
+          });
+
+          if (playbackController.signal.aborted || renderResult.killed) {
+            return;
+          }
+
+          if (renderResult.code !== 0) {
+            const renderOutput = (
+              renderResult.stderr ||
+              renderResult.stdout ||
+              ''
+            ).toString();
+            const errorMessage = formatSubprocessFailure(
+              renderOutput,
+              config.command,
+              'kokoro',
+            );
+            notify(ctx, errorMessage, 'error');
+            return;
+          }
+        } finally {
+          if (existsSync(currentInputPath)) {
+            try {
+              unlinkSync(currentInputPath);
+            } catch {
+              // best-effort cleanup
+            }
+          }
         }
       }
     }
@@ -675,13 +1206,13 @@ async function speakText(
     notify(ctx, 'Spoken latest assistant message.', 'info');
   } catch (error) {
     if (playbackController.signal.aborted || isAbortError(error)) return;
-    notify(ctx, formatExecError(commandForError, error), 'error');
+    notify(ctx, formatExecError(commandForError, error, backendForError), 'error');
   } finally {
     cleanup();
 
-    if (wavPath && existsSync(wavPath)) {
+    if (lastTempWavPath && existsSync(lastTempWavPath)) {
       try {
-        unlinkSync(wavPath);
+        unlinkSync(lastTempWavPath);
       } catch {
         // best-effort cleanup
       }
@@ -748,11 +1279,19 @@ function findLatestAssistantMessage(
   return undefined;
 }
 
-function formatExecError(command: string, error: unknown): string {
+function formatExecError(
+  command: string,
+  error: unknown,
+  backend: TtsBackend,
+): string {
   if (error instanceof Error) {
     const message = error.message.trim();
     if (/enoent|not found/i.test(message)) {
-      return `Piper unavailable. Install Piper and Python first: pip install piper-tts`;
+      if (backend === 'kokoro') {
+        return 'Kokoro unavailable. Install it first: pip install kokoro-tts';
+      }
+
+      return 'Piper unavailable. Install Piper and Python first: pip install piper-tts';
     }
 
     return message || `Failed to run ${command}.`;
@@ -761,18 +1300,33 @@ function formatExecError(command: string, error: unknown): string {
   return `Failed to run ${command}.`;
 }
 
-function formatSubprocessFailure(stderr: string, command: string): string {
+function formatSubprocessFailure(
+  stderr: string,
+  command: string,
+  backend: TtsBackend,
+): string {
   const output = stderr.trim();
   if (!output) {
-    return `Piper failed to run ${command}.`;
+    return backend === 'kokoro'
+      ? `Kokoro failed to run ${command}.`
+      : `Piper failed to run ${command}.`;
   }
 
-  if (/no module named piper|modulenotfounderror/i.test(output)) {
-    return 'Piper is not installed. Install it with: pip install piper-tts';
+  if (/modulenotfounderror|no module named/i.test(output)) {
+    if (backend === 'kokoro' && /kokoro/i.test(output)) {
+      return 'Kokoro is not installed. Install it with: pip install kokoro-tts';
+    }
+    if (backend === 'piper' && /piper/i.test(output)) {
+      return 'Piper is not installed. Install it with: pip install piper-tts';
+    }
   }
 
-  if (/model|voice|file|no such file|cannot find/i.test(output)) {
-    return `Piper could not load the configured voice/model. Check PIPER_PI_MODEL and download the voice.\n\n--- Piper stderr/stdout ---\n${output}`;
+  if (/model|voice|voices|file|no such file|cannot find/i.test(output)) {
+    if (backend === 'kokoro') {
+      return `Kokoro could not load the configured model/voices. Check PI_TTS_MODEL and PI_TTS_VOICES.\n\n--- Kokoro stderr/stdout ---\n${output}`;
+    }
+
+    return `Piper could not load the configured voice/model. Check PI_TTS_MODEL and download the voice.\n\n--- Piper stderr/stdout ---\n${output}`;
   }
 
   return output;
@@ -782,16 +1336,34 @@ function stopCurrentPlayback() {
   activePlaybackController?.abort();
 }
 
-function debugDumpConfig(ctx: ExtensionContext, config: PiperConfig) {
-  const payload = {
-    command: config.command,
-    args: config.args,
-    model: config.model,
-    dataDir: config.dataDir,
-    extraArgs: config.extraArgs,
-    maxChars: config.maxChars,
-    chunkChars: config.chunkChars,
-  };
+function debugDumpConfig(ctx: ExtensionContext, config: TtsConfig) {
+  if ('error' in config) return;
+
+  const payload =
+    config.backend === 'piper'
+      ? {
+          backend: config.backend,
+          command: config.command,
+          args: config.args,
+          model: config.model,
+          dataDir: config.dataDir,
+          extraArgs: config.extraArgs,
+          maxChars: config.maxChars,
+          chunkChars: config.chunkChars,
+        }
+      : {
+          backend: config.backend,
+          command: config.command,
+          args: config.args,
+          modelPath: config.modelPath,
+          voicesPath: config.voicesPath,
+          lang: config.lang,
+          voice: config.voice,
+          speed: config.speed,
+          extraArgs: config.extraArgs,
+          maxChars: config.maxChars,
+          chunkChars: config.chunkChars,
+        };
 
   const message = `PIPER_PI_TTS_DEBUG=1 resolved config: ${JSON.stringify(payload)}`;
   if (ctx.hasUI) notify(ctx, message, 'info');
@@ -935,12 +1507,12 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
     ? (_args: unknown, ctx: ExtensionCommandContext) => Promise<void>
     : never = async (_args: unknown, ctx: ExtensionCommandContext) => {
     if (!activePlaybackController) {
-      notify(ctx, 'No active piper playback to stop.', 'warning');
+      notify(ctx, 'No active TTS playback to stop.', 'warning');
       return;
     }
 
     activePlaybackController.abort();
-    notify(ctx, 'Stopped piper playback.', 'info');
+    notify(ctx, 'Stopped TTS playback.', 'info');
   };
 
   pi.registerCommand('piper-tts', {
@@ -949,7 +1521,7 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('piper-tts-stop', {
-    description: 'Stop the current piper playback',
+    description: 'Stop the current TTS playback',
     handler: stopPlayback,
   });
 

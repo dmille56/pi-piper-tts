@@ -1,8 +1,8 @@
-# Design Doc: `/tts` Pi Extension
+# Design Doc: `/piper-tts` Pi Extension
 
 ## Summary
 
-Add a Pi coding agent extension that registers a `/tts` slash command. The command will read the latest finalized assistant message from the current session branch, extract its spoken text, and send it to Piper for local text-to-speech playback.
+Add a Pi coding agent extension that registers the `/piper-tts` slash command. The command will read the latest finalized assistant message from the current session branch, extract its spoken text, and send it to the configured local TTS backend for playback.
 
 The goal is a lightweight, local-only helper for hearing the AI's last answer aloud without altering the conversation state.
 
@@ -12,7 +12,7 @@ The goal is a lightweight, local-only helper for hearing the AI's last answer al
 - Speak the latest assistant output from the active session branch.
 - Keep the implementation local and offline after dependencies are installed.
 - Avoid mutating session history or generating additional agent turns.
-- Fail gracefully when no assistant message exists, text is empty, or Piper is unavailable.
+- Fail gracefully when no assistant message exists, text is empty, or the selected TTS backend is unavailable.
 
 ## Non-goals
 
@@ -30,7 +30,7 @@ This feature is a Pi extension, so it should use the standard extension APIs:
 - `ctx.waitForIdle()` to ensure the current assistant turn has fully finished before speaking.
 - `ctx.sessionManager.getBranch()` to read the current active session path.
 - `ctx.ui.notify()` to report success or failure.
-- `pi.exec()` to invoke Piper as a subprocess.
+- `pi.exec()` to invoke the selected TTS backend as a subprocess.
 
 Important session semantics:
 
@@ -45,7 +45,7 @@ Relevant Pi docs:
 - Session format: `packages/coding-agent/docs/session-format.md`
 - SessionManager source: `packages/coding-agent/src/core/session-manager.ts`
 
-## Piper integration
+## TTS backend integration
 
 Piper CLI usage from the Piper docs:
 
@@ -144,11 +144,11 @@ Use environment variables for the first version. This avoids designing a new set
 
 Suggested config surface:
 
-- `PIPER_PI_MODEL` — required Piper voice/model identifier or path passed to `-m`
-- `PIPER_PI_DATA_DIR` — optional Piper `--data-dir`
-- `PIPER_PI_BIN` — optional command override, default `python3 -m piper`
-- `PIPER_PI_EXTRA_ARGS` — optional extra CLI args for advanced users
-- `PIPER_PI_MAX_CHARS` — optional safety cap to keep very long answers from producing huge audio
+  - `PI_TTS_MODEL` — required Piper voice/model identifier or path passed to `-m`
+  - `PI_TTS_DATA_DIR` — optional Piper `--data-dir`
+  - `PI_TTS_BIN` — optional renderer command override
+  - `PI_TTS_EXTRA_ARGS` — optional extra CLI args for advanced users
+  - `PI_TTS_MAX_CHARS` — optional safety cap to keep very long answers from producing huge audio
 
 The extension should validate configuration on startup or on first use and show a clear error if the model is missing.
 
