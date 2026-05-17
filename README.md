@@ -77,6 +77,7 @@ Set these environment variables before launching Pi:
 - `PI_TTS_EXTRA_ARGS` — optional extra arguments appended to the backend command
 - `PI_TTS_MAX_CHARS` — optional safety cap for long assistant messages (must be a positive integer)
 - `PI_TTS_CHUNK_CHARS` — optional. Split long assistant messages into smaller chunks so speech starts earlier and `/piper-tts-stop` can cancel reliably mid-message. Must be a positive integer. Default: 200. Set to `0` (or negative) to disable chunking.
+- `PI_TTS_VOLUME` — optional. Volume multiplier for `ffplay` playback. Must be between `0` and `1` (inclusive). `0` mutes; `1` is normal.
 - `PI_TTS_AUTO_PLAY` — optional. When truthy, auto-plays TTS after the agent finishes a user-triggered run.
 
 ### Pi settings (`settings.json`)
@@ -104,6 +105,7 @@ Keys in `pi-tts`:
 - `extra-args` — optional. Extra arguments appended to the backend command
 - `max-chars` — optional. Same as `PI_TTS_MAX_CHARS`
 - `chunk-chars` — optional. Same as `PI_TTS_CHUNK_CHARS`
+- `volume` — optional. Volume multiplier for `ffplay` playback. Must be between `0` and `1` (inclusive). `0` mutes; `1` is normal.
 - `auto-play` — optional boolean. When true, auto-plays TTS after the agent finishes a user-triggered run.
 - `enable-alias` — optional boolean (controls `/tts` alias). Same as `PI_TTS_ENABLE_ALIAS`.
 

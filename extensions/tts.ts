@@ -31,6 +31,7 @@ type PiperConfig = {
   extraArgs: string[];
   maxChars?: number;
   chunkChars?: number;
+  volume?: number;
 };
 
 type KokoroConfig = {
@@ -44,6 +45,7 @@ type KokoroConfig = {
   extraArgs: string[];
   maxChars?: number;
   chunkChars?: number;
+  volume?: number;
 };
 
 type TtsBackend = 'piper' | 'kokoro';
@@ -251,6 +253,56 @@ function parseOptionalBoolean(value: unknown): boolean | undefined {
       return undefined;
     }
   }
+}
+
+export function parseVolume(raw: unknown): {value?: number; error?: string} {
+  if (raw === undefined) return {};
+  if (raw === null) {
+    const invalidError =
+      'PI_TTS_VOLUME (or pi-tts.volume) must be a finite number between 0 and 1 (inclusive).';
+    return {error: invalidError};
+  }
+
+  const invalidError =
+    'PI_TTS_VOLUME (or pi-tts.volume) must be a finite number between 0 and 1 (inclusive).';
+
+  let volume: number;
+
+  if (typeof raw === 'number') {
+    volume = raw;
+  } else if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) return {};
+    volume = Number(trimmed);
+  } else {
+    return {error: invalidError};
+  }
+
+  if (!Number.isFinite(volume)) {
+    return {error: invalidError};
+  }
+
+  if (volume < 0 || volume > 1) {
+    return {error: invalidError};
+  }
+
+  return {value: volume};
+}
+
+export function buildFfplayArgs(parameters: {
+  volume?: number;
+  wavPath: string;
+}): string[] {
+  const {volume, wavPath} = parameters;
+
+  const args: string[] = ['-nodisp', '-autoexit', '-loglevel', 'quiet'];
+  if (volume !== undefined) {
+    // ffplay supports the FFmpeg filter graph syntax.
+    args.push('-af', `volume=${volume}`);
+  }
+
+  args.push(wavPath);
+  return args;
 }
 
 function isTtsAliasEnabledFromSettings(
@@ -493,6 +545,19 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
         ? undefined
         : defaultChunkChars;
 
+  // volume (0..1 inclusive)
+  const volumeRawFromEnv = envTrim('PI_TTS_VOLUME');
+  const volumeRawFromSection = section.volume;
+  const volumeRaw = volumeRawFromEnv ?? volumeRawFromSection;
+  const volumeParsed = parseVolume(volumeRaw);
+
+  if (volumeParsed.error) {
+    maybeWarnOnce();
+    return {error: volumeParsed.error};
+  }
+
+  const volume = volumeParsed.value;
+
   // Renderer bin/args
   const parseBin = (
     binSpec: string,
@@ -707,6 +772,7 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
       extraArgs,
       maxChars,
       chunkChars,
+      volume,
     };
   }
 
@@ -832,6 +898,7 @@ function getConfig(ctx: ExtensionContext): TtsConfig {
     extraArgs,
     maxChars,
     chunkChars,
+    volume,
   };
 }
 
@@ -1239,7 +1306,7 @@ async function speakPiperChunks(parameters: {
 
       const ffplayResult = await pi.exec(
         'ffplay',
-        ['-nodisp', '-autoexit', '-loglevel', 'quiet', currentWavPath],
+        buildFfplayArgs({volume: config.volume, wavPath: currentWavPath}),
         {signal: playbackController.signal},
       );
 
@@ -1648,7 +1715,7 @@ async function speakKokoroChunks(parameters: {
 
       const ffplayResult = await pi.exec(
         'ffplay',
-        ['-nodisp', '-autoexit', '-loglevel', 'quiet', currentWavPath],
+        buildFfplayArgs({volume: config.volume, wavPath: currentWavPath}),
         {signal: playbackController.signal},
       );
 
@@ -1996,6 +2063,7 @@ function debugDumpConfig(ctx: ExtensionContext, config: TtsConfig) {
           extraArgs: config.extraArgs,
           maxChars: config.maxChars,
           chunkChars: config.chunkChars,
+          volume: config.volume,
         }
       : {
           backend: config.backend,
@@ -2009,6 +2077,7 @@ function debugDumpConfig(ctx: ExtensionContext, config: TtsConfig) {
           extraArgs: config.extraArgs,
           maxChars: config.maxChars,
           chunkChars: config.chunkChars,
+          volume: config.volume,
         };
 
   const message = `PIPER_PI_TTS_DEBUG=1 resolved config: ${JSON.stringify(payload)}`;
