@@ -65,6 +65,17 @@ let activePlaybackController: AbortController | undefined;
 // Module-scope so `/piper-tts-stop` can kill the actual `ffplay` process.
 let activePlaybackProcess: ChildProcess | undefined;
 
+// Module-scope so `/piper-tts-stop` can await the current `ffplay` lifecycle.
+let activePlaybackCompletionPromise:
+  | Promise<{
+      stdout: string;
+      stderr: string;
+      code: number;
+      killed: boolean;
+      forcedKill: boolean;
+    }>
+  | undefined;
+
 // One-time deprecation warnings for legacy config/env names.
 let didWarnDeprecatedConfig = false;
 
@@ -321,7 +332,13 @@ async function playFfplay(parameters: {
   volume?: number;
   wavPath: string;
   signal: AbortSignal;
-}): Promise<{stdout: string; stderr: string; code: number; killed: boolean}> {
+}): Promise<{
+  stdout: string;
+  stderr: string;
+  code: number;
+  killed: boolean;
+  forcedKill: boolean;
+}> {
   const {volume, wavPath, signal} = parameters;
   const ffplayProcess = spawn('ffplay', buildFfplayArgs({volume, wavPath}), {
     shell: false,
@@ -333,6 +350,7 @@ async function playFfplay(parameters: {
   let stdout = '';
   let stderr = '';
   let killed = false;
+  let forcedKill = false;
   let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
   const stdoutDecoder = new TextDecoder();
   const stderrDecoder = new TextDecoder();
@@ -345,6 +363,7 @@ async function playFfplay(parameters: {
 
   const killProcess = (force = false) => {
     killed = true;
+    if (force) forcedKill = true;
     killChildProcess(ffplayProcess, force);
 
     if (!force && !forceKillTimer) {
@@ -354,7 +373,13 @@ async function playFfplay(parameters: {
     }
   };
 
-  return new Promise((resolve) => {
+  const completion = new Promise<{
+    stdout: string;
+    stderr: string;
+    code: number;
+    killed: boolean;
+    forcedKill: boolean;
+  }>((resolve) => {
     const cleanup = () => {
       if (forceKillTimer) {
         clearTimeout(forceKillTimer);
@@ -374,14 +399,14 @@ async function playFfplay(parameters: {
       stdout += stdoutDecoder.decode();
       stderr += stderrDecoder.decode();
       cleanup();
-      resolve({stdout, stderr, code: 1, killed});
+      resolve({stdout, stderr, code: 1, killed, forcedKill});
     };
 
     const onExit = (code?: number) => {
       stdout += stdoutDecoder.decode();
       stderr += stderrDecoder.decode();
       cleanup();
-      resolve({stdout, stderr, code: code ?? 0, killed});
+      resolve({stdout, stderr, code: code ?? 0, killed, forcedKill});
     };
 
     ffplayProcess.stdout?.on('data', (data: Uint8Array) => {
@@ -401,6 +426,16 @@ async function playFfplay(parameters: {
       signal.addEventListener('abort', onAbort, {once: true});
     }
   });
+
+  activePlaybackCompletionPromise = completion;
+
+  try {
+    return await completion;
+  } finally {
+    if (activePlaybackCompletionPromise === completion) {
+      activePlaybackCompletionPromise = undefined;
+    }
+  }
 }
 
 function isTtsAliasEnabledFromSettings(
@@ -2159,9 +2194,18 @@ function formatSubprocessFailure(
   return output;
 }
 
-function stopCurrentPlayback() {
+function requestCurrentPlaybackStop() {
   activePlaybackController?.abort();
   activePlaybackProcess?.kill('SIGTERM');
+}
+
+async function stopCurrentPlayback(): Promise<boolean> {
+  const completion = activePlaybackCompletionPromise;
+  if (!completion) return false;
+
+  requestCurrentPlaybackStop();
+  const result = await completion;
+  return !result.forcedKill;
 }
 
 function debugDumpConfig(ctx: ExtensionContext, config: TtsConfig) {
@@ -2211,33 +2255,33 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
   let lastAutoPlayedMessageKey: string | undefined;
 
   pi.on('session_shutdown', () => {
-    stopCurrentPlayback();
+    requestCurrentPlaybackStop();
   });
 
   pi.on('session_before_switch', () => {
-    stopCurrentPlayback();
+    requestCurrentPlaybackStop();
   });
 
   pi.on('session_before_fork', () => {
-    stopCurrentPlayback();
+    requestCurrentPlaybackStop();
   });
 
   pi.on('session_before_tree', () => {
-    stopCurrentPlayback();
+    requestCurrentPlaybackStop();
   });
 
   // Stop playback when the agent begins a new turn, or when the assistant
   // message is streaming/updating (prevents overlapping audio).
   pi.on('turn_start', () => {
-    stopCurrentPlayback();
+    requestCurrentPlaybackStop();
   });
 
   pi.on('message_start', (event) => {
-    if (event.message?.role === 'assistant') stopCurrentPlayback();
+    if (event.message?.role === 'assistant') requestCurrentPlaybackStop();
   });
 
   pi.on('message_update', (event) => {
-    if (event.message?.role === 'assistant') stopCurrentPlayback();
+    if (event.message?.role === 'assistant') requestCurrentPlaybackStop();
   });
 
   pi.on('input', (event) => {
@@ -2347,13 +2391,19 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
   ) => any
     ? (_args: unknown, ctx: ExtensionCommandContext) => Promise<void>
     : never = async (_args: unknown, ctx: ExtensionCommandContext) => {
-    if (!activePlaybackController) {
+    if (!activePlaybackController || !activePlaybackCompletionPromise) {
       notify(ctx, 'No active TTS playback to stop.', 'warning');
       return;
     }
 
-    activePlaybackController.abort();
-    notify(ctx, 'Stopped TTS playback.', 'info');
+    notify(ctx, 'Stopping TTS playback...', 'info');
+
+    const stopped = await stopCurrentPlayback();
+    if (stopped) {
+      notify(ctx, 'Stopped TTS playback.', 'info');
+    } else {
+      notify(ctx, 'Failed to stop TTS playback.', 'error');
+    }
   };
 
   pi.registerCommand('piper-tts', {
@@ -2375,11 +2425,6 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
     });
 
     pi.registerCommand('tts-stop', {
-      description: 'Alias for /piper-tts-stop',
-      handler: stopPlayback,
-    });
-
-    pi.registerCommand('stop-tts', {
       description: 'Alias for /piper-tts-stop',
       handler: stopPlayback,
     });
