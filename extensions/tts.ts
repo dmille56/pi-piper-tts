@@ -3,6 +3,7 @@ import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {performance} from 'node:perf_hooks';
 import {existsSync, readFileSync, unlinkSync, writeFileSync} from 'node:fs';
+import {spawn, type ChildProcess} from 'node:child_process';
 import type {
   AgentEndEvent,
   ExtensionAPI,
@@ -60,6 +61,9 @@ const defaultPiperCommandArgs = ['-m', 'piper'];
 
 // Module-scope so `/piper-tts-stop` can cancel the currently running playback.
 let activePlaybackController: AbortController | undefined;
+
+// Module-scope so `/piper-tts-stop` can kill the actual `ffplay` process.
+let activePlaybackProcess: ChildProcess | undefined;
 
 // One-time deprecation warnings for legacy config/env names.
 let didWarnDeprecatedConfig = false;
@@ -303,6 +307,100 @@ export function buildFfplayArgs(parameters: {
 
   args.push(wavPath);
   return args;
+}
+
+function killChildProcess(child: ChildProcess, force = false) {
+  try {
+    child.kill(force ? 'SIGKILL' : 'SIGTERM');
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+async function playFfplay(parameters: {
+  volume?: number;
+  wavPath: string;
+  signal: AbortSignal;
+}): Promise<{stdout: string; stderr: string; code: number; killed: boolean}> {
+  const {volume, wavPath, signal} = parameters;
+  const ffplayProcess = spawn('ffplay', buildFfplayArgs({volume, wavPath}), {
+    shell: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  activePlaybackProcess = ffplayProcess;
+
+  let stdout = '';
+  let stderr = '';
+  let killed = false;
+  let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+  const stdoutDecoder = new TextDecoder();
+  const stderrDecoder = new TextDecoder();
+
+  const clearActiveProcess = () => {
+    if (activePlaybackProcess === ffplayProcess) {
+      activePlaybackProcess = undefined;
+    }
+  };
+
+  const killProcess = (force = false) => {
+    killed = true;
+    killChildProcess(ffplayProcess, force);
+
+    if (!force && !forceKillTimer) {
+      forceKillTimer = setTimeout(() => {
+        killProcess(true);
+      }, 5000);
+    }
+  };
+
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+        forceKillTimer = undefined;
+      }
+
+      signal.removeEventListener('abort', onAbort);
+      clearActiveProcess();
+    };
+
+    const onAbort = () => {
+      killProcess();
+    };
+
+    const onError = (error: Error) => {
+      stderr += error.message;
+      stdout += stdoutDecoder.decode();
+      stderr += stderrDecoder.decode();
+      cleanup();
+      resolve({stdout, stderr, code: 1, killed});
+    };
+
+    const onExit = (code?: number) => {
+      stdout += stdoutDecoder.decode();
+      stderr += stderrDecoder.decode();
+      cleanup();
+      resolve({stdout, stderr, code: code ?? 0, killed});
+    };
+
+    ffplayProcess.stdout?.on('data', (data: Uint8Array) => {
+      stdout += stdoutDecoder.decode(data, {stream: true});
+    });
+
+    ffplayProcess.stderr?.on('data', (data: Uint8Array) => {
+      stderr += stderrDecoder.decode(data, {stream: true});
+    });
+
+    ffplayProcess.once('error', onError);
+    ffplayProcess.once('exit', onExit);
+
+    if (signal.aborted) {
+      killProcess();
+    } else {
+      signal.addEventListener('abort', onAbort, {once: true});
+    }
+  });
 }
 
 function isTtsAliasEnabledFromSettings(
@@ -1098,11 +1196,27 @@ async function detectKokoroRenderSupport(
   let support: KokoroRenderSupport;
 
   if (hasSave) {
-    support = {
-      supported: true,
-      strategy: hasNoPlay ? 'save-no-play' : 'save',
-      helpSnippet: helpText.slice(0, 800),
-    };
+    // Important: some Kokoro builds play audio even when `--save` is provided.
+    // In that case the extension's `tts-stop` (which only aborts the
+    // subprocess it started) can't reliably stop playback, because the
+    // internal player can keep running.
+    //
+    // To keep `tts-stop` reliable, we only treat `--save` as render-to-wav
+    // when the CLI also exposes `--no-play`.
+    if (hasNoPlay) {
+      support = {
+        supported: true,
+        strategy: 'save-no-play',
+        helpSnippet: helpText.slice(0, 800),
+      };
+    } else {
+      support = {
+        supported: false,
+        reason:
+          '`--save` detected, but `--no-play` was not found in `kokoro-tts --help`. Some Kokoro versions may play audio during rendering, so we fall back to streaming to keep `/tts-stop` reliable.',
+        helpSnippet: helpText.slice(0, 800),
+      };
+    }
   } else if (hasStream && hasOutputToken) {
     support = {
       supported: true,
@@ -1304,11 +1418,11 @@ async function speakPiperChunks(parameters: {
 
       playStartTimes[i] = performance.now();
 
-      const ffplayResult = await pi.exec(
-        'ffplay',
-        buildFfplayArgs({volume: config.volume, wavPath: currentWavPath}),
-        {signal: playbackController.signal},
-      );
+      const ffplayResult = await playFfplay({
+        volume: config.volume,
+        wavPath: currentWavPath,
+        signal: playbackController.signal,
+      });
 
       playEndTimes[i] = performance.now();
 
@@ -1713,11 +1827,11 @@ async function speakKokoroChunks(parameters: {
 
       playStartTimes[i] = performance.now();
 
-      const ffplayResult = await pi.exec(
-        'ffplay',
-        buildFfplayArgs({volume: config.volume, wavPath: currentWavPath}),
-        {signal: playbackController.signal},
-      );
+      const ffplayResult = await playFfplay({
+        volume: config.volume,
+        wavPath: currentWavPath,
+        signal: playbackController.signal,
+      });
 
       playEndTimes[i] = performance.now();
 
@@ -2047,6 +2161,7 @@ function formatSubprocessFailure(
 
 function stopCurrentPlayback() {
   activePlaybackController?.abort();
+  activePlaybackProcess?.kill('SIGTERM');
 }
 
 function debugDumpConfig(ctx: ExtensionContext, config: TtsConfig) {
@@ -2152,10 +2267,15 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
       else console.log(debugMessage);
     }
 
-    const message = [...event.messages]
-      // eslint-disable-next-line unicorn/no-array-reverse
-      .reverse()
-      .find((m) => m.role === 'assistant');
+    let message: (typeof event.messages)[number] | undefined;
+    for (let i = event.messages.length - 1; i >= 0; i--) {
+      const m = event.messages[i];
+      if (m.role === 'assistant') {
+        message = m;
+        break;
+      }
+    }
+
     if (message?.role !== 'assistant') return;
     if (message.stopReason === 'aborted' || message.stopReason === 'error') {
       if (process.env.PIPER_PI_TTS_DEBUG === '1') {
@@ -2213,7 +2333,13 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
       return;
     }
 
-    await speakText(pi, ctx, text);
+    void speakText(pi, ctx, text).catch((error: unknown) => {
+      if (error instanceof Error) {
+        notify(ctx, error.message, 'error');
+      } else {
+        notify(ctx, 'Failed to run TTS playback.', 'error');
+      }
+    });
   };
 
   const stopPlayback: ExtensionAPI['registerCommand'] extends (
@@ -2249,6 +2375,11 @@ export default function piperTtsExtension(pi: ExtensionAPI) {
     });
 
     pi.registerCommand('tts-stop', {
+      description: 'Alias for /piper-tts-stop',
+      handler: stopPlayback,
+    });
+
+    pi.registerCommand('stop-tts', {
       description: 'Alias for /piper-tts-stop',
       handler: stopPlayback,
     });
