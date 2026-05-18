@@ -58,6 +58,8 @@ type TtsConfig =
 
 const defaultPiperCommand = 'python3';
 const defaultPiperCommandArgs = ['-m', 'piper'];
+const playbackForceKillDelayMs = 5000;
+const playbackStopTimeoutMs = 7000;
 
 // Module-scope so `/piper-tts-stop` can cancel the currently running playback.
 let activePlaybackController: AbortController | undefined;
@@ -328,6 +330,14 @@ function killChildProcess(child: ChildProcess, force = false) {
   }
 }
 
+function unlinkIfExists(path: string) {
+  try {
+    if (existsSync(path)) unlinkSync(path);
+  } catch {
+    // best-effort cleanup
+  }
+}
+
 async function playFfplay(parameters: {
   volume?: number;
   wavPath: string;
@@ -341,6 +351,8 @@ async function playFfplay(parameters: {
 }> {
   const {volume, wavPath, signal} = parameters;
   const ffplayProcess = spawn('ffplay', buildFfplayArgs({volume, wavPath}), {
+    cwd: process.cwd(),
+    env: process.env,
     shell: false,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -369,7 +381,7 @@ async function playFfplay(parameters: {
     if (!force && !forceKillTimer) {
       forceKillTimer = setTimeout(() => {
         killProcess(true);
-      }, 5000);
+      }, playbackForceKillDelayMs);
     }
   };
 
@@ -1752,11 +1764,7 @@ async function speakKokoroChunks(parameters: {
       }
 
       if (playbackController.signal.aborted || renderResult.killed) {
-        try {
-          if (existsSync(currentInputPath)) unlinkSync(currentInputPath);
-        } catch {
-          // best-effort cleanup
-        }
+        unlinkIfExists(currentInputPath);
 
         return false;
       }
@@ -1771,20 +1779,12 @@ async function speakKokoroChunks(parameters: {
         );
         notify(ctx, errorMessage, 'error');
 
-        try {
-          if (existsSync(currentInputPath)) unlinkSync(currentInputPath);
-        } catch {
-          // best-effort cleanup
-        }
+        unlinkIfExists(currentInputPath);
 
         return false;
       }
 
-      try {
-        if (existsSync(currentInputPath)) unlinkSync(currentInputPath);
-      } catch {
-        // best-effort cleanup
-      }
+      unlinkIfExists(currentInputPath);
     }
 
     return true;
@@ -2204,8 +2204,23 @@ async function stopCurrentPlayback(): Promise<boolean> {
   if (!completion) return false;
 
   requestCurrentPlaybackStop();
-  const result = await completion;
-  return !result.forcedKill;
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    const result = await Promise.race([
+      completion,
+      new Promise<{timedOut: true}>((resolve) => {
+        timeoutId = setTimeout(() => {
+          resolve({timedOut: true});
+        }, playbackStopTimeoutMs);
+      }),
+    ]);
+
+    if ('timedOut' in result) return false;
+    return !result.forcedKill;
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
 }
 
 function debugDumpConfig(ctx: ExtensionContext, config: TtsConfig) {
